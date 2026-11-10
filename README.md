@@ -10,7 +10,7 @@
 
 ## 功能
 
-- **多个助手集中查看**：本机支持 ChatGPT（Codex）、Claude 桌面版、DeepSeek Harness；
+- **多个助手集中查看**：本机支持 ChatGPT（Codex）、Claude 桌面版的 Cowork 任务、DeepSeek Harness；
   通过 SSH 还可查看服务器上的 Codex 和 Claude Code。
 - **状态提醒**：运行中、需处理（待批准、待回答、待确认、出错）、已完成分开显示；
   桌宠角标显示待查看的数量，有需要处理的任务时变为红色。
@@ -89,7 +89,8 @@ ssh -o BatchMode=yes <HOST> 'echo ok'
 - 已完成的任务保留 24 小时；首次启动前已结束的任务不会显示。
 - 任务超过 30 分钟没有新记录时，会显示为“待确认”。
 - 服务器任务大约每 10 秒更新一次；网络中断期间显示最后一次读取的结果，并标注离线。
-- Claude 仅支持保存在本机的任务，网页端的普通对话不在显示范围内。
+- 本机的 Claude 只显示 Claude 桌面版中 Cowork 模式的任务。普通聊天（记录保存在云端）和本机终端里运行的
+  Claude Code 暂不显示；服务器上的 Claude Code 可通过 SSH 显示。
 
 ## 卸载
 
@@ -105,7 +106,7 @@ ssh -o BatchMode=yes <HOST> 'echo ok'
 
 ## 致谢
 
-- [DeepSeek](https://www.deepseek.com) 与 [Claude](https://claude.com)：本项目在它们的协助下设计、编写和测试。
+- [DeepSeek](https://www.deepseek.com)、[Claude](https://claude.com) 与 [ChatGPT](https://chatgpt.com)：本项目在它们的协助下设计、编写和测试。
 - [python-build-standalone](https://github.com/astral-sh/python-build-standalone)：应用内置的 Python 运行时。
 - [python-zstandard](https://github.com/indygreg/python-zstandard)：用于读取 DeepSeek Harness 的压缩会话记录。
 - ChatGPT、Claude、DeepSeek 的名称与图标归各自所有者所有，本应用仅用于标识对应的应用。
