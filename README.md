@@ -107,6 +107,5 @@ ssh -o BatchMode=yes <HOST> 'echo ok'
 ## 致谢
 
 - [DeepSeek](https://www.deepseek.com)、[Claude](https://claude.com) 与 [ChatGPT](https://chatgpt.com)：本项目在它们的协助下设计、编写和测试。
-- [python-build-standalone](https://github.com/astral-sh/python-build-standalone)：应用内置的 Python 运行时。
 - [python-zstandard](https://github.com/indygreg/python-zstandard)：用于读取 DeepSeek Harness 的压缩会话记录。
 - ChatGPT、Claude、DeepSeek 的名称与图标归各自所有者所有，本应用仅用于标识对应的应用。
