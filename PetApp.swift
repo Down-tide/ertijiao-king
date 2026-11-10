@@ -1493,9 +1493,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             collectorHealthy = true
             refresh(); showPanel()
             try await Task.sleep(nanoseconds: 700_000_000)
-            // Machine row: ALL (every machine, the default) first, then Mac and each server.
+            // Machine row: ALL (every machine, the default) first, then Local and each server.
             let chips = try await js("Array.from(document.querySelectorAll('.mchip span')).map(e => e.textContent)") as? [String]
-            try verify(chips == ["ALL", "Mac", "Studio", "Build"], "machine-row-with-all")
+            try verify(chips == ["ALL", "Local", "Studio", "Build"], "machine-row-with-all")
             let dots = try await js("Array.from(document.querySelectorAll('.mchip .dot')).map(e => e.className)") as? [String]
             try verify(dots == ["dot done running", "dot done running", "dot none running", "dot none"], "machine-dot-worst-state")
             let offlineTag = try await js("document.querySelector('.mchip.offline em')?.textContent") as? String
@@ -1506,7 +1506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             let allRows = try await js("document.querySelectorAll('#list .row').length") as? Int
             try verify(allRows == 4, "all-machines-shows-everything")
             let badges = try await js("Array.from(document.querySelectorAll('#list .host-badge')).map(e => e.textContent).sort().join(',')") as? String
-            try verify(badges == "127,17,Mac,Mac", "all-machines-rows-name-their-machine")
+            try verify(badges == "Build,Local,Local,Studio", "all-machines-rows-name-their-machine")
             _ = try await js("document.querySelector('[data-machine=\"__local__\"]').click()")
             try await Task.sleep(nanoseconds: 300_000_000)
             let macRows = try await js("document.querySelectorAll('#list .row').length") as? Int
