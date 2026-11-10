@@ -152,19 +152,33 @@ def tail_rows(path, budget=TAIL_BUDGET):
 
 
 def _OPENS_TURN(row):
-    """An event that *starts* a turn or names a thread.
+    """An event that truly *starts* a turn, or names a thread.
 
-    `task_complete` deliberately does not count. After a compact, Codex writes the
-    ending of a long turn far from its beginning: a tail that happens to contain
-    only the ending would look complete, the window would stop widening, and the
-    user's question (written at task_started) would be lost.
+    Two things deliberately do not count:
+
+    - Codex's `task_complete`. After a compact the ending sits far from the
+      beginning; a tail holding only the ending would look complete and the
+      question (written at task_started) would be lost.
+    - Claude's `tool_result` rows. They are `type: user` but they are tool output
+      echoing back, not something you typed. A long file can have tens of
+      thousands of them and no real prompt, so treating them as an opening
+      stops the window from widening right where the question is missing.
+    - Claude's `assistant` rows. Replies come after the question; a tail full of
+      tool loops has plenty of them and still no question, so they cannot stand
+      in for the start of an exchange either.
     """
     typ = row.get('type')
     if typ == 'session_meta':
         return True
     if typ == 'event_msg':
         return (row.get('payload') or {}).get('type') == 'task_started'
-    return typ in ('user', 'assistant')
+    if typ == 'user':
+        content = (row.get('message') or {}).get('content')
+        if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get('type') == 'tool_result' for part in content):
+            return False        # tool output, not a question
+        return True
+    return False
 
 
 # Claude 的转写同理：一段很长的工具调用之后，尾部可能没有开场记录。

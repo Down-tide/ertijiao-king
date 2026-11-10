@@ -165,6 +165,38 @@ class ProbeChecks(unittest.TestCase):
         ])
         self.assertEqual(self.collect()['items'][0]['prompt'], '继续把预览问题修完')
 
+    def test_claude_tail_widens_past_a_long_tool_loop(self):
+        """Claude 的工具循环会写出上千条 tool_result 和 assistant 行，但没有任何提问。
+
+        它们都是 type user/assistant，如果算"开轮"，窗口就不再扩大，
+        提问就永远读不到。真实现场：17 上 40MB 的转写，提问在 82.5%，4MB 窗口从 90% 开始。
+        """
+        rows = []
+        # 抛在很前面的真实提问
+        rows.append({'type': 'user', 'sessionId': '377a70e3', 'timestamp': self.iso(7200),
+                     'message': {'role': 'user', 'content': '把标注结果整理一下'}})
+        rows.append({'type': 'assistant', 'sessionId': '377a70e3', 'timestamp': self.iso(7199),
+                     'message': {'role': 'assistant', 'stop_reason': 'tool_use',
+                                 'content': [{'type': 'text', 'text': '好的'}]}})
+        # 数千条工具循环：只有 tool_result 和 assistant，没有真人提问
+        for i in range(20000):
+            rows.append({'type': 'user', 'sessionId': '377a70e3', 'timestamp': self.iso(3600),
+                         'message': {'role': 'user', 'content': [
+                             {'type': 'tool_result', 'tool_use_id': 't%d' % i,
+                              'content': 'x' * 300}]}})
+            rows.append({'type': 'assistant', 'sessionId': '377a70e3', 'timestamp': self.iso(3599),
+                         'message': {'role': 'assistant', 'stop_reason': 'tool_use',
+                                     'content': [{'type': 'tool_use', 'id': 't%d' % i,
+                                                  'name': 'Bash', 'input': {}}]}})
+        rows.append({'type': 'assistant', 'sessionId': '377a70e3', 'timestamp': self.iso(60),
+                     'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                                 'content': [{'type': 'text', 'text': '整理完了'}]}})
+        self.claude_session('377a70e3', rows, name='数据处理')
+        os.utime(next((self.home/'.claude/projects').rglob('*.jsonl')), (self.now, self.now))
+        item = self.collect()['items'][0]
+        self.assertEqual(item['prompt'], '把标注结果整理一下')
+        self.assertEqual(item['detail'], '整理完了')
+
     def test_codex_compact_keeps_the_question_visible(self):
         """compact 之后，提问写在很靠前的位置，尾部只剩结束事件。
 
