@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>二踢脚大王的任务提醒</title>
+<style>
+  :root {
+    color-scheme: light;
+    --ink: #152126; --muted: #708086; --line: #e6ece9; --bg: #ffffff;
+    --mint: #5aa98d; --mint-strong: #2f866d; --mint-pale: #e4f2ec;
+    --orange: #e9764a; --orange-pale: #fdeee6; --yellow: #e9a93a; --blue: #5d86c4; --blue-pale: #e8eff9;
+    --red: #d64545; --red-pale: #fde8e8; --yellow-pale: #fdf3df; --grey: #a3aeaa; --grey-pale: #eef1f0;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { color: var(--ink); background: var(--bg); font: 13px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; -webkit-user-select: none; user-select: none; cursor: default; overflow: hidden; }
+  button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; padding: 0; }
+  .panel { height: 100%; display: flex; flex-direction: column; background: var(--bg); }
+  body.preview { background: #e9efec; display: grid; place-items: center; }
+  body.preview .panel { width: 380px; height: 560px; border-radius: 18px; box-shadow: 0 24px 70px rgba(29,61,50,.22); overflow: hidden; }
+
+  .head { display: flex; align-items: center; gap: 11px; padding: 16px 16px 12px; }
+  .head img { width: 38px; height: 38px; border-radius: 50%; object-fit: cover; border: 2px solid var(--mint-pale); }
+  .head-copy { flex: 1; min-width: 0; }
+  .head h1 { margin: 0; font-size: 15px; font-weight: 700; }
+  .head p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
+  .close { width: 26px; height: 26px; border-radius: 8px; color: var(--muted); background: #f3f7f5; font-size: 16px; line-height: 26px; }
+  .close:hover { background: #e8efec; }
+
+  .tabs { display: flex; gap: 6px; padding: 0 16px 10px; border-bottom: 1px solid var(--line); }
+  .tab { padding: 5px 10px; border-radius: 8px; color: var(--muted); font-size: 11px; font-weight: 600; }
+  .tab.active { color: var(--mint-strong); background: var(--mint-pale); }
+  .tab b { font-weight: 700; margin-left: 2px; }
+
+  .notice { margin: 10px 14px 0; padding: 10px 12px; border-radius: 10px; background: var(--orange-pale); color: #8a4122; font-size: 11px; line-height: 1.55; }
+  .notice .actions { margin-top: 7px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .notice .actions button { padding: 4px 9px; border-radius: 7px; background: #fff; color: #8a4122; font-size: 11px; font-weight: 600; }
+  .notice.info { background: var(--blue-pale); color: #2f4f80; }
+
+  .list { flex: 1; overflow-y: auto; padding: 4px 8px 8px; }
+  .group-title { display: flex; justify-content: space-between; align-items: center; padding: 12px 8px 4px; color: var(--muted); font-size: 11px; font-weight: 600; }
+  .host-head { display: flex; align-items: center; gap: 6px; padding: 12px 8px 3px; color: var(--ink); font-size: 11.5px; font-weight: 700; }
+  .host-head i { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); flex: none; }
+  .host-head.stale i { background: var(--yellow); } .host-head.offline i { background: var(--orange); }
+  .host-head small { color: var(--muted); font-weight: 500; font-size: 10.5px; }
+  .host-head .spacer { flex: 1; }
+  .host-head button { color: var(--mint-strong); font-size: 10.5px; font-weight: 600; }
+  .host-note { margin: 0 8px 4px; padding: 7px 9px; border-radius: 8px; background: #fdf3ea; color: #8a4122; font-size: 10.5px; line-height: 1.55; }
+  .machines { display: flex; gap: 6px; padding: 0 16px 10px; overflow-x: auto; }
+  .machines:empty { display: none; }
+  .mchip { display: flex; align-items: center; gap: 6px; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); font-size: 11.5px; font-weight: 650; white-space: nowrap; }
+  .mchip.active { color: var(--ink); border-color: var(--mint); background: var(--mint-pale); }
+  .mchip em { font-style: normal; font-size: 10px; font-weight: 600; color: var(--grey); }
+  .mchip.offline span, .mchip.stale span { color: var(--grey); }
+  /* 机器圆点：无任务透明、有完成绿、要你处理黄、出错红；有任务在跑时外面一圈蓝色在转 */
+  .dot { position: relative; width: 8px; height: 8px; border-radius: 50%; flex: none; box-sizing: border-box; }
+  .dot.none { border: 1.5px solid #c3cdc9; background: transparent; }
+  .dot.done { background: var(--mint); } .dot.warn { background: var(--yellow); } .dot.bad { background: var(--red); }
+  .dot.running::after { content: ''; position: absolute; inset: -4px; border-radius: 50%; border: 1.5px solid rgba(93,134,196,.25); border-top-color: var(--blue); animation: spin 1.2s linear infinite; }
+  .sub-title { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px 2px 22px; color: var(--muted); font-size: 10.5px; font-weight: 600; }
+  .sub-title button { color: var(--mint-strong); font-size: 10.5px; font-weight: 600; }
+  .host-empty { padding: 4px 22px 10px; color: var(--muted); font-size: 10.5px; }
+  .host-badge { flex: none; padding: 1px 5px; border-radius: 5px; background: #eef2f0; color: var(--muted); font-size: 9.5px; font-weight: 700; }
+  .group-title button { color: var(--mint-strong); font-size: 11px; font-weight: 600; }
+  .row { display: grid; grid-template-columns: 30px minmax(0,1fr) auto; gap: 10px; align-items: center; padding: 9px 8px; border-radius: 10px; }
+  .row.clickable:hover { background: #f4f8f6; cursor: pointer; }
+  .logo { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; color: #fff; font-size: 12px; font-weight: 800; }
+  .logo { background: #f5f6f6; }
+  .logo img { display: block; width: 23px; height: 23px; object-fit: contain; }
+  .logo.claude { background: #faf4ee; }
+  .logo.deepseek { background: #eef2ff; }
+  .row-copy { min-width: 0; }
+  .row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 650; }
+  .row-prompt { color: var(--ink); font-size: 11.5px; line-height: 1.5; margin: 4px 0 3px; padding: 4px 8px; border-left: 3px solid var(--mint); border-radius: 4px; background: #f3f8f6; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+  .row-prompt b { color: var(--mint-strong); font-weight: 700; margin-right: 5px; }
+  .row-prompt.none { color: var(--muted); border-left-color: #cfd8d5; background: transparent; }
+  .followups { margin: -1px 0 3px; padding: 2px 8px 3px; border-left: 3px solid #b9dccf; border-radius: 4px; background: #f7faf9; }
+  .followup { color: var(--ink); font-size: 11px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .followup b { color: var(--muted); font-weight: 700; margin-right: 5px; }
+  .followup-more { color: var(--muted); font-size: 10px; line-height: 1.5; }
+  .row-meta .detail b { color: var(--muted); font-weight: 600; }
+  .row-meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; color: var(--muted); font-size: 10.5px; white-space: nowrap; overflow: hidden; }
+  .row-meta .detail { overflow: hidden; text-overflow: ellipsis; }
+  .row-meta b { color: var(--ink); font-weight: 600; flex: none; }
+  .tag { flex: none; padding: 1px 6px; border-radius: 6px; font-size: 10px; font-weight: 700; }
+  .tag.success { color: var(--mint-strong); background: var(--mint-pale); }
+  .tag.error, .tag.bad { color: #b42f2f; background: var(--red-pale); }
+  .tag.warn { color: #9a6410; background: var(--yellow-pale); }
+  .tag.stopped { color: #6f7b77; background: var(--grey-pale); }
+  .tag.notice { color: #3c62a0; background: var(--blue-pale); }
+  .tag.resumed { color: #3c62a0; background: var(--blue-pale); margin: 0; line-height: inherit; }
+  .spinner { width: 16px; height: 16px; border-radius: 50%; border: 2px solid #dbe5f3; border-top-color: var(--blue); animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .check { width: 26px; height: 26px; border-radius: 8px; color: #fff; background: var(--mint); font-size: 13px; font-weight: 700; }
+  .check:hover { background: var(--mint-strong); }
+  .empty { padding: 44px 16px; text-align: center; color: var(--muted); font-size: 12px; line-height: 1.8; }
+
+  .foot { border-top: 1px solid var(--line); padding: 8px 12px; display: flex; align-items: center; gap: 6px; }
+  .chip { display: flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 8px; background: #f5f8f6; font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+  .chip i { width: 6px; height: 6px; border-radius: 50%; background: #c3cdc9; }
+  .chip.on i { background: var(--mint); } .chip.warn i { background: var(--orange); }
+  .chip img { width: 13px; height: 13px; object-fit: contain; display: block; }
+  .chip.on { color: var(--ink); }
+  .foot .spacer { flex: 1; }
+  .foot .quit { flex: none; display: flex; align-items: center; height: 24px; white-space: nowrap;
+                color: var(--muted); font-size: 10.5px; padding: 0 6px; border-radius: 7px; }
+  .foot .quit:hover { background: #f3f7f5; color: var(--ink); }
+
+  /* 设置页 */
+  /* 和“退出”文字同一行居中：两者都在 24px 的行盒里垂直居中，
+     图标用 flex 居中而不是靠 line-height，避免字体基线把它压偏。 */
+  /* 齿轮图标字形本身偏下（⚙ 的视觉重心不居中），用 transform 上提 1px 才能和“退出”两字对齐。 */
+  .foot .gear { flex: none; width: 24px; height: 24px; border-radius: 6px; color: var(--muted);
+                font-size: 17px; display: flex; align-items: center; justify-content: center; }
+  .foot .gear > span { display: block; transform: translateY(-1px); }
+  .foot .gear:hover { background: #f3f7f5; color: var(--ink); }
+  .foot .gear.on { background: var(--mint-pale); color: var(--mint-strong); }
+  .settings { flex: 1; overflow-y: auto; padding: 4px 14px 14px; }
+  .settings h2 { margin: 14px 0 6px; font-size: 11.5px; font-weight: 700; color: var(--muted); }
+  .settings h2:first-child { margin-top: 4px; }
+  .field { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
+  .field label { flex: none; width: 74px; color: var(--muted); font-size: 11px; }
+  .field input[type=text] { flex: 1; min-width: 0; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; font: inherit; font-size: 11.5px; background: #fff; color: var(--ink); }
+  .field input[type=text]:focus { outline: none; border-color: var(--mint); box-shadow: 0 0 0 2px var(--mint-pale); }
+  .field input[type=range] { flex: 1; accent-color: var(--mint); }
+  .field .hint { color: var(--muted); font-size: 10px; }
+  .switch { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 11.5px; }
+  .switch input { accent-color: var(--mint); width: 15px; height: 15px; }
+  .host-row { display: grid; grid-template-columns: 1.6fr 1fr 24px; gap: 6px; align-items: center; padding: 4px 0; }
+  .host-row input { width: 100%; min-width: 0; padding: 5px 7px; border: 1px solid var(--line); border-radius: 7px; font: inherit; font-size: 11px; background: #fff; color: var(--ink); }
+  .host-row input:focus { outline: none; border-color: var(--mint); box-shadow: 0 0 0 2px var(--mint-pale); }
+  .host-row .drop { width: 22px; height: 22px; border-radius: 6px; color: var(--muted); background: #f5f8f6; font-size: 12px; }
+  .host-row .drop:hover { background: var(--orange-pale); color: #8a4122; }
+  .host-head-row { display: grid; grid-template-columns: 1.6fr 1fr 24px; gap: 6px; padding: 0 0 3px; color: var(--muted); font-size: 10px; }
+  .settings .add { margin-top: 6px; padding: 5px 10px; border-radius: 7px; background: var(--mint-pale); color: var(--mint-strong); font-size: 11px; font-weight: 600; }
+  .settings .actions { display: flex; gap: 8px; align-items: center; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .settings .save { padding: 6px 14px; border-radius: 8px; background: var(--mint); color: #fff; font-size: 11.5px; font-weight: 700; }
+  .settings .save:hover { background: var(--mint-strong); }
+  .settings .revert { padding: 6px 10px; border-radius: 8px; color: var(--muted); font-size: 11px; }
+  .settings .revert:hover { background: #f3f7f5; color: var(--ink); }
+  .settings .path-note { color: #8a6d3b; background: #fdf6e6; border-radius: 8px; padding: 6px 9px; font-size: 10.5px; line-height: 1.5; margin: 4px 0 2px; }
+  .settings .status { margin-left: auto; color: var(--mint-strong); font-size: 10.5px; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <header class="head">
+    <img src="assets/pet-avatar.png" alt="">
+    <div class="head-copy">
+      <h1>二踢脚大王的任务提醒</h1>
+      <p id="summary">正在读取任务…</p>
+    </div>
+    <button class="close" data-act="close" title="收起面板 (Esc)">×</button>
+  </header>
+  <nav class="machines" id="machines"></nav>
+  <nav class="tabs">
+    <button class="tab active" data-tab="all">全部<b id="cntAll"></b></button>
+    <button class="tab" data-tab="running">运行中<b id="cntRunning"></b></button>
+    <button class="tab" data-tab="attention">需处理<b id="cntAttention"></b></button>
+    <button class="tab" data-tab="done">已完成<b id="cntDone"></b></button>
+  </nav>
+  <div id="notice"></div>
+  <main class="list" id="list"></main>
+  <main class="settings" id="settings" hidden></main>
+  <footer class="foot" id="foot"></footer>
+</div>
+<script>
+const AGENTS = {
+  chatgpt: { label: 'ChatGPT', icon: 'chatgpt.svg' },
+  claude: { label: 'Claude', icon: 'claude.svg' },
+  deepseek: { label: 'DeepSeek Harness', icon: 'deepseek.svg' }
+};
+const STATE_TAG = { success: '完成', error: '出错', notice: '通知' };
+const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.pet;
+let state = { agents: {}, hosts: [], running: [], done: [], notifications: { status: 'ok' } };
+const LOCAL = '__local__';
+const ALL = '__all__';
+let tab = 'all';
+let machine = ALL;       // the machine being shown: ALL (every machine), LOCAL (this Mac) or a server id
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function send(msg) { if (bridge) bridge.postMessage(msg); }
+
+function ago(ts) {
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return '刚刚';
+  if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
+  if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
+  return Math.floor(s / 86400) + ' 天前';
+}
+function clock(ts) { return new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }); }
+function elapsed(ts) {
+  const m = Math.max(0, Math.floor((Date.now() / 1000 - ts) / 60));
+  return m < 1 ? '刚开始' : m < 60 ? '已运行 ' + m + ' 分钟' : '已运行 ' + Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
+}
+// 任务属于哪台机器：本机的没有 host 字段；远程的用 host。顺序固定，别让列表跳动。
+function hostOf(t) { return t.host || LOCAL; }
+function hostInfo(id) {
+  if (id === LOCAL) return { label: '本机 Mac', status: 'ok' };
+  return (state.hosts || []).find((h) => h.id === id) || { label: id, status: 'offline', hint: '不在服务器列表里' };
+}
+function hostHeading(id, count) {
+  const info = hostInfo(id);
+  const status = id === LOCAL ? '' : (info.status || 'offline');
+  const alias = info.alias ? ` · ${info.alias}` : '';
+  const live = id === LOCAL ? '' : info.machine ? ` · ${info.machine}` : '';
+  const dot = `<i></i><span>${esc(info.label)}</span><small>${esc(alias + live)}</small><span class="spacer"></span>`;
+  return `<div class="host-head ${esc(status)}">${dot}${count ? `<span class="host-badge">${count}</span>` : ''}</div>`;
+}
+function hostNote(id, named) {
+  // ALL: one note per server that is down, each named so you know which one.
+  if (id === ALL) return (state.hosts || []).map((h) => hostNote(h.id, true)).join('');
+  if (id === LOCAL) return '';
+  const info = hostInfo(id);
+  if (info.status === 'ok' || info.status === 'pending') return '';
+  const when = info.fetchedAt ? `；显示的是 ${ago(info.fetchedAt)}的数据` : '';
+  return `<div class="host-note">${esc((named ? info.label + '：' : '') + (info.hint || '连不上这台服务器'))}${esc(when)}</div>`;
+}
+// In the ALL view each row says which machine it is on.
+function machineBadge(t) {
+  if (machine !== ALL || !(state.hosts || []).length) return '';
+  return `<span class="host-badge">${esc(hostOf(t) === LOCAL ? 'Mac' : hostInfo(t.host).label)}</span>`;
+}
+function logo(agent) { const a = AGENTS[agent]; return a ? `<div class="logo ${esc(agent)}"><img src="assets/logos/${a.icon}" alt="${esc(a.label)}"></div>` : '<div class="logo">?</div>'; }
+function label(agent) { return (AGENTS[agent] || { label: agent }).label; }
+// Your own question for this turn (first message you sent), not the reply.
+// 第一个问题 + 任务没答完时你追加的问题（最近两条，更早的只写条数）。
+function promptPreview(t) {
+  if (!t.prompt) return '<div class="row-prompt none">没找到这一轮的提问</div>';
+  const first = `<div class="row-prompt" title="${esc(t.prompt)}"><b>Prompt</b>${esc(t.prompt)}</div>`;
+  const more = Array.isArray(t.followups) ? t.followups.filter((v) => typeof v === 'string' && v).slice(-2) : [];
+  if (!more.length) return first;
+  const earlier = Math.max(0, (Number(t.followupCount) || more.length) - more.length);
+  const lines = more.map((v) => `<div class="followup" title="${esc(v)}"><b>追加</b>${esc(v)}</div>`).join('');
+  const note = earlier ? `<div class="followup-more">更早还有 ${earlier} 条追加</div>` : '';
+  return first + `<div class="followups">${note}${lines}</div>`;
+}
+
+function resumedTag(t) {
+  return t.resumed ? '<span class="tag resumed" title="上一轮被停止或出错后，Codex 自己开始了新的一轮">自动继续</span>' : '';
+}
+
+// 远程任务打不开远端窗口：点它是用终端连过去，不代跑命令。
+function openTip(t) {
+  if (!t.host) return '打开对应应用（ChatGPT 可定位会话）';
+  return `在终端里连到 ${hostInfo(t.host).label} 查看（不会替你启动或停止任务）`;
+}
+
+function runningRow(t) {
+  const detail = t.detail ? `<span class="detail">${esc(t.detail)}</span>` : '';
+  return `<div class="row clickable" data-open="${esc(t.id)}" title="${esc(openTip(t))}">${logo(t.agent)}
+    <div class="row-copy"><div class="row-title">${esc(t.title)}</div>${promptPreview(t)}
+    <div class="row-meta">${resumedTag(t)}${machineBadge(t)}<b>${esc(label(t.agent))}</b><span>${elapsed(t.start)}</span>${detail}</div></div>
+    <div class="spinner" aria-label="运行中"></div></div>`;
+}
+// 已中断：多数是你自己按了停止，不用处理；放在“已完成”里，灰色标签，不计入角标。
+function isStopped(t) { return t.state === 'interrupted'; }
+function doneRow(t) {
+  const stopped = isStopped(t);
+  const tag = stopped ? '<span class="tag stopped">已中断</span>' : `<span class="tag ${esc(t.state)}">${STATE_TAG[t.state] || '完成'}</span>`;
+  const detail = !t.detail || t.detail === '已完成' || t.detail === '已中断' ? ''
+    : `<div class="row-meta"><span class="detail">${stopped ? '' : '<b>回复</b> '}${esc(t.detail)}</span></div>`;
+  return `<div class="row clickable" data-view="${esc(t.id)}" title="${t.host ? esc(openTip(t)) : '打开对应应用并收起'}">${logo(t.agent)}
+    <div class="row-copy"><div class="row-title">${esc(t.title)}</div>${promptPreview(t)}
+    <div class="row-meta">${tag}${machineBadge(t)}<b>${esc(label(t.agent))}</b><span>${ago(t.time)} · ${clock(t.time)}</span></div>
+    ${detail}</div>
+    <button class="check" data-dismiss="${esc(t.id)}" title="收起，不打开">✓</button></div>`;
+}
+// 需处理里的每一种状态：显示名、颜色、排序（越小越靠前）。黄 warn = 要你处理；红 bad = 出错。
+const ATTENTION = {
+  waiting:     { tag: '待批准',   cls: 'warn',    order: 0 },   // 停下来等你批准一个操作
+  question:    { tag: '待回答',   cls: 'warn',    order: 0 },   // 问了你问题（选项卡片），等你回答
+  error:       { tag: '出错',     cls: 'bad',     order: 1 },
+  unknown:     { tag: '待确认',   cls: 'warn',    order: 2 },   // 30 分钟没动静，或结束了但没有结果
+};
+function attention(t) { return ATTENTION[t.state] || ATTENTION.unknown; }
+function sortAttention(list) { return list.slice().sort((a, b) => attention(a).order - attention(b).order || (b.time || 0) - (a.time || 0)); }
+// Skip the detail line when it only repeats the tag (e.g. "已中断" twice).
+function pendingDetail(t) {
+  // "未收到结束记录" only fits 待确认; other states without a detail just show their tag.
+  const detail = t.detail || (t.state === 'unknown' ? '未收到结束记录' : '');
+  return !detail || detail === attention(t).tag ? '' : `<div class="row-meta"><span class="detail">${esc(detail)}</span></div>`;
+}
+function pendingRow(t) {
+  const a = attention(t);
+  return `<div class="row clickable" data-open="${esc(t.id)}" title="${esc(openTip(t))}">${logo(t.agent)}
+    <div class="row-copy"><div class="row-title">${esc(t.title)}</div>${promptPreview(t)}
+    <div class="row-meta"><span class="tag ${a.cls}">${a.tag}</span>${machineBadge(t)}<b>${esc(label(t.agent))}</b><span>${ago(t.time || t.start)} · ${clock(t.time || t.start)}</span></div>
+    ${pendingDetail(t)}</div><button class="check" data-dismiss="${esc(t.id)}" title="收起">✓</button></div>`;
+}
+let openError = false;
+function renderNotice() {
+  let notes = [];
+  if (openError) notes.push('没有成功打开对应应用，任务已保留。可以稍后重试，或点 ✓ 手动收起。');
+  if (state.collectorHealthy === false) notes.push('正在连接本地任务记录；若长时间没有更新，请重新打开桌宠。');
+  for (const [agent, info] of Object.entries(state.agents || {})) {
+    if (info.status && info.status !== 'ok') notes.push(`${label(agent)}：${info.hint || '记录暂时无法读取'}`);
+  }
+  // Only real problems get a banner; no standing "what is covered" notice.
+  $('notice').innerHTML = notes.length ? `<div class="notice">${notes.map(esc).join('<br>')}</div>` : '';
+}
+window.petOpenError = () => { openError = true; renderNotice(); };
+
+function renderFoot() {
+  const chips = ['chatgpt', 'claude', 'deepseek'].map((key) => {
+    const a = (state.agents || {})[key] || {};
+    const cls = a.status && a.status !== 'ok' ? 'warn' : a.open ? 'on' : '';
+    const tip = `${label(key)} · 数据来自${a.source || '—'} · ${a.open ? '应用已打开' : '应用未打开'}${a.hint ? ' · ' + a.hint : ''}`;
+    const icon = AGENTS[key] ? `<img src="assets/logos/${AGENTS[key].icon}" alt="">` : '';
+    return `<span class="chip ${cls}" title="${esc(tip)}">${icon}${esc(key === 'deepseek' ? 'DeepSeek' : label(key))}<i></i></span>`;
+  }).join('');
+  $('foot').innerHTML = chips + '<span class="spacer"></span>'
+    + '<button class="gear" data-act="toggleSettings" title="设置"><span>⚙</span></button>'
+    + '<button class="quit" data-act="quit" title="退出桌宠">退出</button>';
+}
+
+function machineOrder() { return [ALL, LOCAL].concat((state.hosts || []).map((h) => h.id)); }
+function onMachine(list, id) { return id === ALL ? list.slice() : list.filter((t) => hostOf(t) === id); }
+// One machine's (or ALL's) tasks, split the way the tabs show them. The dot, the
+// tooltip and the tab numbers all come from here, so they always agree.
+function machineTasks(id) {
+  const mine = onMachine(state.pending || [], id);
+  const success = onMachine(state.done || [], id);
+  return {
+    running: onMachine(state.running || [], id),
+    pending: sortAttention(mine.filter((t) => !isStopped(t))),                     // 需处理：只有黄和红
+    success,
+    // 已完成 = 完成 + 已中断（灰），按时间排在一起。
+    done: success.concat(mine.filter(isStopped)).sort((a, b) => (b.time || 0) - (a.time || 0)),
+  };
+}
+// 圆点：红 > 黄 > 绿 > 透明，只显示最严重的；有任务在跑时外面加一圈转动的蓝环。已中断不影响圆点。
+function machineDot(id) {
+  const t = machineTasks(id);
+  const level = t.pending.some((x) => attention(x).cls === 'bad') ? 'bad'
+    : t.pending.length ? 'warn' : t.success.length ? 'done' : 'none';
+  return `<i class="dot ${level}${t.running.length ? ' running' : ''}"></i>`;
+}
+// 悬停说明：写实际的数字，和下面的标签一致；全都为 0 才说“没有任务”。
+function machineSummary(id) {
+  const t = machineTasks(id);
+  const bad = t.pending.filter((x) => attention(x).cls === 'bad').length;
+  const parts = [];
+  if (t.running.length) parts.push(`运行中 ${t.running.length}`);
+  if (t.pending.length) parts.push(`需处理 ${t.pending.length}${bad ? `（出错 ${bad}）` : ''}`);
+  if (t.done.length) parts.push(`已完成 ${t.done.length}`);
+  return parts.length ? parts.join(' · ') : '没有任务';
+}
+function machineTip(id) {
+  if (id === ALL) {
+    const down = (state.hosts || []).filter((h) => h.status === 'offline' || h.status === 'stale').length;
+    return `全部机器 · ${machineSummary(ALL)}${down ? ` · ${down} 台服务器连不上` : ''}`;
+  }
+  if (id === LOCAL) return `本机 Mac · ${machineSummary(LOCAL)}`;
+  const h = hostInfo(id);
+  const conn = h.status === 'ok' ? '已连接' : h.status === 'pending' ? '正在连接' : (h.hint || '离线');
+  return `${h.alias || h.label}${h.machine ? ' · ' + h.machine : ''} · ${conn} · ${machineSummary(id)}`;
+}
+function renderMachines() {
+  const hosts = state.hosts || [];
+  if (!hosts.length) { $('machines').innerHTML = ''; return; }        // only this Mac: nothing to choose
+  const chip = (id, text) => {
+    const h = hosts.find((x) => x.id === id);
+    const conn = h ? (h.status || 'pending') : 'ok';
+    const off = conn === 'offline' ? '<em>离线</em>' : conn === 'stale' ? '<em>旧数据</em>' : conn === 'pending' ? '<em>连接中</em>' : '';
+    return `<button class="mchip ${esc(conn)} ${machine === id ? 'active' : ''}" data-machine="${esc(id)}" title="${esc(machineTip(id))}">${machineDot(id)}<span>${esc(text)}</span>${off}</button>`;
+  };
+  $('machines').innerHTML = chip(ALL, 'ALL') + chip(LOCAL, 'Mac') + hosts.map((h) => chip(h.id, h.label)).join('');
+}
+
+function render() {
+  if (!machineOrder().includes(machine)) machine = ALL;
+  const { running, pending, done } = machineTasks(machine);
+  const count = (n) => n ? ' ' + n : '';
+  $('cntAll').textContent = count(running.length + done.length + pending.length);
+  $('cntRunning').textContent = count(running.length);
+  $('cntAttention').textContent = count(pending.length);
+  $('cntDone').textContent = count(done.length);
+  // Header line covers every machine, so a server that needs you is never missed.
+  const all = (k) => (state[k] || []).length;
+  const allNeedYou = (state.pending || []).filter((t) => !isStopped(t)).length;
+  $('summary').textContent = all('running') || all('done') || allNeedYou
+    ? `${all('running')} 个运行中 · ${all('done')} 个待查看${allNeedYou ? ' · ' + allNeedYou + ' 个需处理' : ''}`
+    : '没有需要处理的任务';
+  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+
+  const now = Date.now() / 1000;
+  const recent = done.filter((t) => now - (t.time || 0) <= 3600), older = done.filter((t) => now - (t.time || 0) > 3600);
+  const parts = {
+    all: [['运行中', running, runningRow], ['需处理', pending, pendingRow], ['刚刚完成', recent, doneRow], ['更早完成（24 小时内）', older, doneRow]],
+    running: [['', running, runningRow]],
+    attention: [['', pending, pendingRow]],
+    done: [['刚刚完成', recent, doneRow], ['更早完成（24 小时内）', older, doneRow]],
+  }[tab].filter(([, list]) => list.length);
+  let html = hostNote(machine);
+  let toolbarPlaced = false;
+  for (const [title, list, row] of parts) {
+    const toolbar = row === doneRow && !toolbarPlaced ? (toolbarPlaced = true, '<button data-act="dismissAll">全部收起</button>') : '';
+    const heading = title ? `${title} ${list.length}` : '';
+    if (title || toolbar) html += `<div class="sub-title"><span>${heading}</span>${toolbar}</div>`;
+    html += list.map(row).join('');
+  }
+  if (!parts.length) {
+    const where = machine === ALL && (state.hosts || []).length ? '所有机器' : '这台机器';
+    html += {
+      all: `<div class="empty">${where}现在没有任务。<br>可以安心喝杯水。</div>`,
+      running: `<div class="empty">${where}现在没有运行中的任务。</div>`,
+      attention: '<div class="empty">没有要你处理的任务。</div>',
+      done: '<div class="empty">完成的任务都收起来了。<br>有新的完成，角标会提醒你。</div>',
+    }[tab];
+  }
+  $('list').innerHTML = html;
+  renderMachines();
+  renderNotice();
+  renderFoot();
+}
+
+function dismiss(ids) {
+  const drop = new Set(ids);
+  state.done = (state.done || []).filter((t) => !drop.has(t.id));
+  state.pending = (state.pending || []).filter((t) => !drop.has(t.id));
+  render();
+  send({ type: 'dismiss', ids: ids });
+}
+
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-tab],[data-machine],[data-act],[data-dismiss],[data-view],[data-open]');
+  if (!el) return;
+  if (el.dataset.tab) { tab = el.dataset.tab; render(); return; }
+  if (el.dataset.machine) { machine = el.dataset.machine; render(); return; }
+  if (el.dataset.dismiss) { e.stopPropagation(); dismiss([el.dataset.dismiss]); return; }
+  if (el.dataset.view) { openError = false; if (bridge) send({ type: 'view', id: el.dataset.view }); else dismiss([el.dataset.view]); return; }
+  if (el.dataset.open) { send({ type: 'open', id: el.dataset.open }); return; }
+  const act = el.dataset.act;
+  if (act === 'dismissAll') {
+    // Everything under 已完成 on the machine being shown (every machine for ALL), grey 已中断 included.
+    dismiss(machineTasks(machine).done.map((t) => t.id));
+  }
+  else if (act === 'toggleSettings') {
+    // 再点一次同一个按钮就收起设置，回到任务列表。
+    if (showSettings) { showSettings = false; draft = null; renderAll(); }
+    else beginSettings();
+    return;
+  }
+  else if (act === 'closeSettings') { showSettings = false; draft = null; renderAll(); return; }
+  else if (act === 'addHost') {
+    readSettingsForm();
+    draft.remote.hosts.push({ id: '', alias: '', label: '' });
+    renderSettings();
+    return;
+  }
+  else if (act === 'dropHost') {
+    readSettingsForm();
+    draft.remote.hosts.splice(Number(el.dataset.i), 1);
+    renderSettings();
+    return;
+  }
+  else if (act === 'revertConfig') { beginSettings(); return; }
+  else if (act === 'saveConfig') {
+    if (!draftFromDisk) {
+      // 还没读到 config.json 时的表单是空的，存下去会把服务器列表清空。
+      configStatus = '设置还在读取，稍等一下再保存';
+      renderSettings();
+      return;
+    }
+    const next = readSettingsForm();
+    configStatus = '正在保存…';
+    renderSettings();
+    send({ type: 'saveConfig', config: next });
+    return;
+  }
+  else if (act) send({ type: act });
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') send({ type: 'close' }); });
+
+// Swift 每次有新数据时调用
+
+// ---------------------------------------------------------------- 设置页
+// 配置来自 Swift 送进来的 state.config；保存时发 {type:'saveConfig', config}。
+// 面板只做编辑和校验提示，真正落盘和生效由 Swift + collector 负责。
+// default 只是占位提示：留空就用它，填了就覆盖。
+const PATH_FIELDS = [
+  { key: 'codex', label: 'ChatGPT', default: '~/.codex' },
+  { key: 'claude', label: 'Claude', default: '~/Library/Application Support/Claude' },
+  { key: 'deepseek', label: 'DeepSeek', default: '~/.dsh/sessions' },
+];
+let showSettings = false;
+let draft = null;          // 编辑中的副本；离开设置页不保存就丢弃
+let configStatus = '';     // 保存后的反馈文字
+let draftFromDisk = false; // 表单是不是从真正读到的 config.json 来的（否则是空表单，不能保存）
+
+function cloneConfig(c) {
+  const base = c || {};
+  return {
+    version: base.version || 1,
+    local: Object.assign({ codex: '', claude: '', deepseek: '' }, base.local || {}),
+    remote: {
+      enabled: !!((base.remote || {}).enabled),
+      hosts: ((base.remote || {}).hosts || []).map((h) => ({
+        id: h.id || '', alias: h.alias || '', label: h.label || '',
+      })),
+    },
+    appearance: { scale: (base.appearance || {}).scale || 1 },
+  };
+}
+
+function beginSettings() {
+  draft = cloneConfig(state.config);
+  draftFromDisk = !!state.configLoaded;
+  configStatus = '';
+  showSettings = true;
+  renderAll();          // 切换视图：隐藏任务列表，显示设置页
+}
+
+function renderSettings() {
+  const el = $('settings');
+  if (!draft) { el.innerHTML = ''; return; }
+  const hosts = draft.remote.hosts;
+  const rows = hosts.map((h, i) => `
+    <div class="host-row">
+      <input type="text" data-host="alias" data-i="${i}" value="${esc(h.alias)}" placeholder="HOST">
+      <input type="text" data-host="label" data-i="${i}" value="${esc(h.label)}" placeholder="显示名">
+      <button class="drop" data-act="dropHost" data-i="${i}" title="删掉这台">×</button>
+    </div>`).join('');
+
+  el.innerHTML = `
+    <h2>本机记录位置</h2>
+    ${PATH_FIELDS.map((f) => `
+      <div class="field">
+        <label>${esc(f.label)}</label>
+        <input type="text" data-path="${esc(f.key)}" value="${esc(draft.local[f.key] || '')}" placeholder="${esc(f.default)}">
+      </div>`).join('')}
+
+    <h2>服务器</h2>
+    <div class="switch">
+      <input type="checkbox" id="remoteOn" ${draft.remote.enabled ? 'checked' : ''}>
+      <label for="remoteOn">启用 SSH 远程采集</label>
+    </div>
+    ${hosts.length ? '<div class="host-head-row"><span>HOST</span><span>显示名</span><span></span></div>' : ''}
+    ${rows || '<div class="host-empty">还没有服务器</div>'}
+    <button class="add" data-act="addHost">+ 添加服务器</button>
+
+    <div class="actions">
+      <button class="save" data-act="saveConfig">保存</button>
+      <button class="revert" data-act="revertConfig">还原</button>
+      <button class="revert" data-act="closeSettings">关闭</button>
+      <span class="status">${esc(configStatus)}</span>
+    </div>`;
+}
+
+function readSettingsForm() {
+  if (!draft) return draft;
+  document.querySelectorAll('#settings [data-path]').forEach((input) => {
+    draft.local[input.dataset.path] = input.value.trim();
+  });
+  document.querySelectorAll('#settings [data-host]').forEach((input) => {
+    const host = draft.remote.hosts[Number(input.dataset.i)];
+    if (host) host[input.dataset.host] = input.value.trim();
+  });
+  // 标识不用手填：HOST 唯一就够了，重复的由后端去重。
+  draft.remote.hosts.forEach((h) => { if (!h.id) h.id = h.alias; });
+  const on = $('remoteOn');
+  if (on) draft.remote.enabled = on.checked;
+  return draft;
+}
+
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'scale') {
+    const v = $('scaleValue');
+    if (v) v.textContent = Math.round(Number(e.target.value) * 100) + '%';
+  }
+});
+
+function renderAll() {
+  const gear = document.querySelector('.gear');
+  if (gear) gear.classList.toggle('on', showSettings);
+  if (showSettings) { $('list').hidden = true; $('settings').hidden = false; }
+  else { $('list').hidden = false; $('settings').hidden = true; }
+  render();
+  if (showSettings) renderSettings();
+}
+
+window.petRender = (next) => {
+  state = next || state;
+  // 设置页先于 config.json 打开：读到之后用真实内容重建表单，否则会保存一份空设置。
+  if (showSettings && !draftFromDisk && state.configLoaded) {
+    draft = cloneConfig(state.config);
+    draftFromDisk = true;
+  }
+  renderAll();
+};
+// 面板被收起时重置视图：下次打开应该看到任务列表，而不是上次停留的设置页。
+window.petPanelHidden = () => {
+  showSettings = false;
+  draft = null;
+  configStatus = '';
+  renderAll();
+};
+// Swift 保存完配置后回一句，告诉用户成没成。
+window.petConfigSaved = (ok, message) => {
+  configStatus = ok ? (message || '已保存') : (message || '保存失败');
+  if (ok) { draft = cloneConfig(state.config); draftFromDisk = true; }
+  if (showSettings) renderSettings();
+};
+setInterval(render, 30000);
+
+if (bridge) {
+  send({ type: 'ready' });
+} else {
+  // 浏览器预览只使用虚构数据，不包含用户对话内容。
+  document.body.classList.add('preview');
+  const now = Date.now() / 1000;
+  state = {
+    collectorHealthy: true,
+    agents: Object.fromEntries(Object.keys(AGENTS).map(a => [a, {status:'ok', open:true, source:'本地任务记录'}])),
+    running: [{id:'preview-running', agent:'deepseek', title:'整理项目资料', start:now-120}],
+    done: [{id:'preview-done', agent:'claude', title:'生成本周总结', detail:'内容已准备好', state:'success', time:now-60}],
+    pending: []
+  };
+  render();
+}
+</script>
+</body>
+</html>

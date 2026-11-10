@@ -1,0 +1,16 @@
+# 构建产物
+dist/
+build/
+build-backups/
+*.app
+*.zip
+
+# 构建用的 Python（scripts/fetch_deps.py 下载）
+runtime/
+
+# 运行期数据
+config.json
+*.log
+__pycache__/
+*.pyc
+.DS_Store
