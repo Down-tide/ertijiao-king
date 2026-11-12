@@ -18,6 +18,8 @@ import time
 
 WINDOW = 24 * 3600
 STALE = 30 * 60
+# 这些 stop_reason 说明这一轮是异常结束的，不是正常完成。
+FAILED_REASONS = {'refusal', 'max_tokens', 'model_context_window_exceeded'}
 RECORD_FRESH = 5 * 60        # 注册表 5 分钟内被写过，说明这个进程还活着
 TITLE_LIMIT = 50
 PROMPT_LIMIT = 120
@@ -524,7 +526,7 @@ def claude_tail(rows):
     they are one task named by the first prompt, with the rest as follow-ups.
     """
     last_prompt = last_reply = last_row = 0
-    end_turn = interrupt = 0
+    end_turn = interrupt = failure = 0
     replies = []
     current = None                          # exchange in flight: {'prompt', 'start', 'followups', ...}
     done = None                             # last finished exchange
@@ -576,8 +578,15 @@ def claude_tail(rows):
             if reply:
                 replies = (replies + [reply])[-3:]
             last_reply = max(last_reply, ts)
-            if message.get('stop_reason') == 'end_turn':
+            # A turn is over whenever the model stopped on its own terms. `tool_use` means it
+            # is still working (more calls are coming); every other reason ends the turn,
+            # including `refusal`, `max_tokens` and `pause_turn`. Only checking end_turn left
+            # refused or truncated turns looking like they were still running.
+            reason = message.get('stop_reason')
+            if reason and reason != 'tool_use':
                 end_turn = max(end_turn, ts)
+                if reason in FAILED_REASONS:
+                    failure = max(failure, ts)
                 if current is not None:
                     done, current = current, None
     shown = current or done or {}
@@ -585,7 +594,8 @@ def claude_tail(rows):
             'followups': shown.get('followups', []), 'followup_count': shown.get('followup_count', 0),
             'prompt_at': last_prompt, 'reply': (replies or [''])[-1],
             'replies': replies, 'reply_at': last_reply, 'end': end_turn,
-            'interrupt': interrupt, 'last': max(last_prompt, last_reply, last_row),
+            'interrupt': interrupt, 'failure': failure,
+            'last': max(last_prompt, last_reply, last_row),
             'question': max(questions.values(), key=lambda q: q[1]) if questions else None}
 
 
@@ -698,7 +708,12 @@ def collect_claude(home, now, window, host):
         elif pending:
             state, detail, end = 'unknown', '命令已结束，未收到结果，请查看服务器上的任务', last
         elif tail['end']:
-            state, detail, end = 'success', tail['reply'] or '已完成', tail['end']
+            # A turn that ended on refusal / truncation is an error, not a completion: the work
+            # did not happen and you need to see that in the panel.
+            if tail.get('failure') and tail['failure'] >= tail['end']:
+                state, detail, end = 'error', tail['reply'] or '推理被中断（模型拒绝或超出长度）', tail['failure']
+            else:
+                state, detail, end = 'success', tail['reply'] or '已完成', tail['end']
         elif rec and rec['status'] == 'idle':
             state, detail, end = 'success', tail['reply'] or '已完成', max(tail['last'], rec.get('statusAt') or 0)
         elif not tail['prompt']:

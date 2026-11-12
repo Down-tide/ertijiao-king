@@ -165,6 +165,42 @@ class ProbeChecks(unittest.TestCase):
         ])
         self.assertEqual(self.collect()['items'][0]['prompt'], '继续把预览问题修完')
 
+    def test_claude_refusal_is_an_error_not_running(self):
+        """Claude 被安全策略拒绝、或超出长度时，这一轮是异常结束，不是还在跑。
+
+        真实现场：17 上"Editformer v6推理"已经报 API Error，
+        面板却一直显示运行中，因为只把 end_turn 当结束。
+        """
+        rows = [
+            self.user('跑一下推理实验', 600),
+            {'type': 'assistant', 'isSidechain': False, 'sessionId': 's-1', 'timestamp': self.iso(590),
+             'message': {'role': 'assistant', 'stop_reason': 'tool_use',
+                         'content': [{'type': 'tool_use', 'id': 't1', 'name': 'Bash', 'input': {}}]}},
+            self.user('继续', 500),
+            {'type': 'assistant', 'isSidechain': False, 'sessionId': 's-1', 'timestamp': self.iso(490),
+             'message': {'role': 'assistant', 'stop_reason': 'refusal',
+                         'content': [{'type': 'text',
+                                      'text': "API Error: Opus 5.5's safeguards flagged this message"}]}},
+        ]
+        self.claude_session('s-1', rows)
+        os.utime(next((self.home/'.claude/projects').rglob('*.jsonl')), (self.now, self.now))
+        item = self.collect()['items'][0]
+        self.assertEqual(item['state'], 'error')
+        self.assertIn('safeguards', item['detail'])
+
+    def test_claude_max_tokens_also_ends_the_turn(self):
+        """被截断（max_tokens）同样是这一轮结束了，不能一直显示运行中。"""
+        rows = [
+            self.user('生成长文档', 300),
+            {'type': 'assistant', 'isSidechain': False, 'sessionId': 's-1', 'timestamp': self.iso(290),
+             'message': {'role': 'assistant', 'stop_reason': 'max_tokens',
+                         'content': [{'type': 'text', 'text': '写到一半就断了'}]}},
+        ]
+        self.claude_session('s-1', rows)
+        os.utime(next((self.home/'.claude/projects').rglob('*.jsonl')), (self.now, self.now))
+        item = self.collect()['items'][0]
+        self.assertEqual(item['state'], 'error')
+
     def test_claude_tail_widens_past_a_long_tool_loop(self):
         """Claude 的工具循环会写出上千条 tool_result 和 assistant 行，但没有任何提问。
 
