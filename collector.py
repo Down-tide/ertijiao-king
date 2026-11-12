@@ -449,7 +449,90 @@ def queued_prompt(row):
     return '' if raw.startswith(CLAUDE_NOISE_PREFIXES) else prompt_preview(raw)
 
 
-def fold_claude_followups(turns, created):
+_claude_queue_cache = {}
+_CLAUDE_QUEUE_CACHE_LIMIT = 64
+
+
+def _claude_queue_signals(audit_path, audit_session_ids):
+    """Read Claude's queue journal when it is beside this audit file.
+
+    Claude records a queued message as ``remove/absorbed_mid_turn`` when the
+    message is folded into the current turn.  A normal ``dequeue`` means the
+    message really started a separate turn.  The audit file alone does not
+    preserve that distinction, so use the journal as an optional authority.
+    """
+    session_dir = audit_path.parent / '.claude' / 'projects' / 'session'
+    try:
+        candidates = list(session_dir.glob('*.jsonl'))
+    except OSError:
+        return set(), set(), []
+    if not candidates:
+        return set(), set(), []
+    ids = {str(value) for value in audit_session_ids if value}
+    exact = [p for p in candidates if p.stem in ids]
+    if len(exact) == 1:
+        transcript = exact[0]
+    elif len(exact) > 1:
+        return set(), set(), []
+    elif len(candidates) == 1:
+        # Older Claude versions did not put a session id in audit rows.
+        transcript = candidates[0]
+    else:
+        # Never combine queue operations from another conversation.
+        return set(), set(), []
+    try:
+        st = transcript.stat()
+        key = (str(transcript), st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError:
+        return set(), set(), []
+    cached = _claude_queue_cache.get(key)
+    if cached is not None:
+        return cached
+    # Drop old versions of this transcript after a rewrite and bound the
+    # process-wide cache because audit files are discovered over many sessions.
+    for old_key in list(_claude_queue_cache):
+        if old_key[0] == str(transcript):
+            _claude_queue_cache.pop(old_key, None)
+    absorbed_ids, absorbed_prompts, dispatched = set(), set(), []
+    waiting = []
+    try:
+        with transcript.open(encoding='utf-8', errors='replace') as f:
+            for row in json_lines(f):
+                if row.get('type') != 'queue-operation':
+                    continue
+                operation = row.get('operation')
+                when = stamp(row.get('timestamp'))
+                if operation == 'enqueue':
+                    value = prompt_preview(row.get('content') or row.get('prompt'))
+                    waiting.append((value, when))
+                elif operation == 'dequeue':
+                    if waiting:
+                        value, queued_at = waiting.pop(0)
+                        if value:
+                            dispatched.append((value, when or queued_at))
+                elif operation == 'remove' and row.get('reason') == 'absorbed_mid_turn':
+                    command_id = row.get('commandUuid') or row.get('command_uuid')
+                    if command_id:
+                        absorbed_ids.add(str(command_id))
+                    value = prompt_preview(row.get('content') or row.get('prompt'))
+                    if value:
+                        absorbed_prompts.add(value)
+                    # The absorbed item leaves the queue; do not let a later
+                    # dequeue accidentally claim this old prompt.
+                    for index, (queued, _queued_at) in enumerate(waiting):
+                        if not value or queued == value:
+                            waiting.pop(index)
+                            break
+    except (OSError, UnicodeError, ValueError):
+        return set(), set(), []
+    result = (absorbed_ids, absorbed_prompts, dispatched)
+    _claude_queue_cache[key] = result
+    while len(_claude_queue_cache) > _CLAUDE_QUEUE_CACHE_LIMIT:
+        _claude_queue_cache.pop(next(iter(_claude_queue_cache)))
+    return result
+
+
+def fold_claude_followups(turns, created, absorbed_ids=None, absorbed_prompts=None, dispatched=None):
     """A message you send while Claude is still working is answered in the same run.
 
     The app gives it its own command, but that command usually never gets a
@@ -458,6 +541,9 @@ def fold_claude_followups(turns, created):
     (one task, your first prompt), unless it later ran by itself and produced its
     own outcome after the earlier one had finished.
     """
+    absorbed_ids = {str(value) for value in (absorbed_ids or ())}
+    absorbed_prompts = set(absorbed_prompts or ())
+    dispatched = list(dispatched or ())
     order = sorted(turns.values(), key=lambda t: (created.get(t['id']) or t['start'] or 0, t['id']))
     lead = None
     for t in order:
@@ -472,7 +558,18 @@ def fold_claude_followups(turns, created):
             # needs its own outcome; after a stop or error it is new work either way.
             ran_alone = bool(lead['end']) and t.get('started_at', 0) > lead['end'] and (
                 lead['state'] != 'success' or t['end'] or not t.get('soft_end'))
-            if made <= finish and not ran_alone:
+            # The transcript is authoritative when available.  An absorbed
+            # command belongs to the lead even if its timestamps look like a
+            # new task; a normally dequeued command stays independent even if
+            # the old audit command never logged an end.
+            absorbed = t['id'] in absorbed_ids or t.get('prompt', '') in absorbed_prompts
+            dispatched_on_its_own = bool(t.get('prompt')) and any(
+                t.get('prompt') == prompt and sent and any(
+                    when and abs(when - sent) <= 5
+                    for when in (made, t.get('start') or 0, t.get('started_at') or 0)
+                )
+                for prompt, sent in dispatched)
+            if absorbed or (not dispatched_on_its_own and made <= finish and not ran_alone):
                 if not lead['end'] and t['end']:
                     # The earlier command finished without a result; the follow-up carries it.
                     lead.update(end=t['end'], state=t['state'], detail=t['detail'])
@@ -497,10 +594,14 @@ def parse_claude(path):
     active = None
     prompts = {}
     created = {}            # command id -> when you sent it
+    audit_session_ids = set()
     with open(path, encoding='utf-8', errors='replace') as f:
         for row in json_lines(f):
             if row.get('parent_tool_use_id'):
                 continue
+            session_id = row.get('session_id') or row.get('sessionId')
+            if session_id:
+                audit_session_ids.add(str(session_id))
             typ, ts = row.get('type'), stamp(row.get('timestamp') or row.get('_audit_timestamp'))
             if typ == 'user':
                 value = claude_prompt(row)
@@ -578,7 +679,8 @@ def parse_claude(path):
                 state = 'error' if row.get('is_error') else 'interrupted' if reason in ('aborted', 'interrupted', 'cancelled') else 'success' if row.get('subtype') == 'success' else 'unknown'
                 t.update(end=ts, state=state, detail=one_line(row.get('result')) or {'success':'已完成', 'error':'任务出错', 'interrupted':'已中断', 'unknown':'回合结束，结果待确认'}[state])
                 active = t
-    fold_claude_followups(info['turns'], created)
+    absorbed_ids, absorbed_prompts, dispatched = _claude_queue_signals(path, audit_session_ids)
+    fold_claude_followups(info['turns'], created, absorbed_ids, absorbed_prompts, dispatched)
     for t in info['turns'].values():
         # When you sent it, not when it began running (a queued message waits for its turn).
         t['asked_at'] = created.get(t['id']) or t['start']

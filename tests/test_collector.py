@@ -214,6 +214,57 @@ class CollectorChecks(unittest.TestCase):
         self.assertEqual(len(r),1)
         self.assertEqual((r[0]['prompt'],r[0]['followups'],r[0]['followupCount']),('先修登录',['顺便看下日志'],1))
 
+    def test_claude_transcript_merges_all_absorbed_followups(self):
+        rows = [
+            {'type':'user','uuid':'a','timestamp':self.now-300,'message':{'content':'主任务'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'a','state':'started','timestamp':self.now-300,
+             'session_id':'session-test'},
+            {'type':'user','uuid':'b','timestamp':self.now-200,'message':{'content':'追加一'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'b','state':'started','timestamp':self.now-180,
+             'session_id':'session-test'},
+            {'type':'user','uuid':'c','timestamp':self.now-100,'message':{'content':'追加二'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'c','state':'started','timestamp':self.now-90,
+             'session_id':'session-test'},
+        ]
+        queue = [
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-300,'sessionId':'session-test','content':'主任务'},
+            {'type':'queue-operation','operation':'dequeue','timestamp':self.now-299,'sessionId':'session-test'},
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-200,'sessionId':'session-test','content':'追加一'},
+            {'type':'queue-operation','operation':'remove','timestamp':self.now-180,'sessionId':'session-test','content':'追加一','reason':'absorbed_mid_turn','commandUuid':'b'},
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-100,'sessionId':'session-test','content':'追加二'},
+            {'type':'queue-operation','operation':'remove','timestamp':self.now-90,'sessionId':'session-test','content':'追加二','reason':'absorbed_mid_turn','commandUuid':'c'},
+        ]
+        reader = self.claude_audit_with_transcript(rows, queue)
+        r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual((len(r), len(d), len(p)), (1, 0, 0))
+        self.assertEqual((r[0]['prompt'], r[0]['followups'], r[0]['followupCount']),
+                         ('主任务', ['追加一', '追加二'], 2))
+
+    def test_claude_transcript_dequeue_keeps_a_new_task_separate(self):
+        rows = [
+            {'type':'user','uuid':'a','timestamp':self.now-600,'message':{'content':'旧任务'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'a','state':'started','timestamp':self.now-600,
+             'session_id':'session-test'},
+            {'type':'user','uuid':'b','timestamp':self.now-200,'message':{'content':'新任务'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'b','state':'started','timestamp':self.now-190,
+             'session_id':'session-test'},
+        ]
+        queue = [
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-600,'sessionId':'session-test','content':'旧任务'},
+            {'type':'queue-operation','operation':'dequeue','timestamp':self.now-599,'sessionId':'session-test'},
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-200,'sessionId':'session-test','content':'新任务'},
+            {'type':'queue-operation','operation':'dequeue','timestamp':self.now-190,'sessionId':'session-test'},
+        ]
+        reader = self.claude_audit_with_transcript(rows, queue)
+        r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual([item['prompt'] for item in r], ['新任务'])
+        self.assertEqual((d, p), ([], []))
+
     def test_unclosed_claude_command_does_not_swallow_later_tasks(self):
         # The first command never logs an end; its follow-up starts and finishes, then a new
         # question runs on its own. The new question must stay a separate task.
@@ -232,6 +283,14 @@ class CollectorChecks(unittest.TestCase):
     def claude_audit_reader(self, rows):
         path = self.base/'sess/abcd1234/audit.jsonl'
         self.write(path, rows)
+        return c.Reader('claude', self.base, '*/*/audit.jsonl', c.parse_claude)
+
+    def claude_audit_with_transcript(self, rows, queue_rows, session_id='session-test'):
+        path = self.base/'sess/abcd1234/audit.jsonl'
+        audit = [dict(row, session_id=row.get('session_id', session_id)) for row in rows]
+        self.write(path, audit)
+        transcript = path.parent/'.claude/projects/session'/f'{session_id}.jsonl'
+        self.write(transcript, queue_rows)
         return c.Reader('claude', self.base, '*/*/audit.jsonl', c.parse_claude)
 
     def test_new_prompt_retires_a_finished_turn_you_have_seen(self):

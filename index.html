@@ -198,6 +198,7 @@ function elapsed(ts) {
 // 任务属于哪台机器：本机的没有 host 字段；远程的用 host。顺序固定，别让列表跳动。
 function hostOf(t) { return t.host || LOCAL; }
 function hostInfo(id) {
+  // PET-LABEL-ONLY-BEGIN 本机版叫 Mac，发布版叫 Local，其余代码完全一样。
   if (id === LOCAL) return { label: 'Local', status: 'ok' };
   return (state.hosts || []).find((h) => h.id === id) || { label: id, status: 'offline', hint: '不在服务器列表里' };
 }
@@ -222,6 +223,7 @@ function hostNote(id, named) {
 function machineBadge(t) {
   if (machine !== ALL || !(state.hosts || []).length) return '';
   return `<span class="host-badge">${esc(hostOf(t) === LOCAL ? 'Local' : hostInfo(t.host).label)}</span>`;
+  // PET-LABEL-ONLY-END
 }
 function logo(agent) { const a = AGENTS[agent]; return a ? `<div class="logo ${esc(agent)}"><img src="assets/logos/${a.icon}" alt="${esc(a.label)}"></div>` : '<div class="logo">?</div>'; }
 function label(agent) { return (AGENTS[agent] || { label: agent }).label; }
@@ -353,6 +355,7 @@ function machineTip(id) {
     const down = (state.hosts || []).filter((h) => h.status === 'offline' || h.status === 'stale').length;
     return `全部机器 · ${machineSummary(ALL)}${down ? ` · ${down} 台服务器连不上` : ''}`;
   }
+  // PET-LABEL-ONLY-BEGIN
   if (id === LOCAL) return `Local · ${machineSummary(LOCAL)}`;
   const h = hostInfo(id);
   const conn = h.status === 'ok' ? '已连接' : h.status === 'pending' ? '正在连接' : (h.hint || '离线');
@@ -368,6 +371,7 @@ function renderMachines() {
     return `<button class="mchip ${esc(conn)} ${machine === id ? 'active' : ''}" data-machine="${esc(id)}" title="${esc(machineTip(id))}">${machineDot(id)}<span>${esc(text)}</span>${off}</button>`;
   };
   $('machines').innerHTML = chip(ALL, 'ALL') + chip(LOCAL, 'Local') + hosts.map((h) => chip(h.id, h.label)).join('');
+  // PET-LABEL-ONLY-END
 }
 
 function render() {

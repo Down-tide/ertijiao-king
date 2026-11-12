@@ -1454,6 +1454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             defaults.removeObject(forKey: "trackingStartedAt")
             defaults.removeObject(forKey: "trackingInitialActiveIDs")
             let now = Date().timeIntervalSince1970
+            // PET-LOCAL-FIXTURE-BEGIN 本机版用真实机器名（17/127），发布版用花名（Studio/Build）。
             rawState = [
                 "agents": ["chatgpt": ["status": "ok", "open": true], "claude": ["status": "ok", "open": true], "deepseek": ["status": "ok", "open": true]],
                 "hosts": [["id": "h1", "label": "Studio", "alias": "gpu-box", "machine": "gpu-box",
@@ -1466,6 +1467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
                 "done": [["id": "test-done", "agent": "claude", "title": "本周总结已完成", "prompt": "请把实验记录整理成一份简短周报", "detail": "点击任务可打开对应应用", "time": now-60, "state": "success", "open": ["type": "app", "value": "invalid.test.app"]]],
                 "pending": [["id": "test-pending", "agent": "chatgpt", "host": "h2", "title": "等待确认的任务", "prompt": "帮我检查图标和动作 <img src=x onerror=alert(1)>", "followups": ["顺便看下日志 <img src=x onerror=alert(2)>"], "followupCount": 3, "detail": "任务已中断，可打开应用查看", "time": now-80, "state": "interrupted"]]
             ]
+            // PET-LOCAL-FIXTURE-END
             let fixture = rawState
             rawState["version"] = 4
             establishInitialBaselineIfNeeded()
@@ -1493,9 +1495,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             collectorHealthy = true
             refresh(); showPanel()
             try await Task.sleep(nanoseconds: 700_000_000)
-            // Machine row: ALL (every machine, the default) first, then Local and each server.
+            // Machine row: ALL (every machine, the default) first, then Mac and each server.
             let chips = try await js("Array.from(document.querySelectorAll('.mchip span')).map(e => e.textContent)") as? [String]
+            // PET-LOCAL-FIXTURE-BEGIN
             try verify(chips == ["ALL", "Local", "Studio", "Build"], "machine-row-with-all")
+            // PET-LOCAL-FIXTURE-END
             let dots = try await js("Array.from(document.querySelectorAll('.mchip .dot')).map(e => e.className)") as? [String]
             try verify(dots == ["dot done running", "dot done running", "dot none running", "dot none"], "machine-dot-worst-state")
             let offlineTag = try await js("document.querySelector('.mchip.offline em')?.textContent") as? String
@@ -1506,7 +1510,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             let allRows = try await js("document.querySelectorAll('#list .row').length") as? Int
             try verify(allRows == 4, "all-machines-shows-everything")
             let badges = try await js("Array.from(document.querySelectorAll('#list .host-badge')).map(e => e.textContent).sort().join(',')") as? String
+            // PET-LOCAL-FIXTURE-BEGIN
             try verify(badges == "Build,Local,Local,Studio", "all-machines-rows-name-their-machine")
+            // PET-LOCAL-FIXTURE-END
             _ = try await js("document.querySelector('[data-machine=\"__local__\"]').click()")
             try await Task.sleep(nanoseconds: 300_000_000)
             let macRows = try await js("document.querySelectorAll('#list .row').length") as? Int
@@ -1567,8 +1573,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify(gearIconOnly == "⚙", "settings-button-is-icon-only")
             updateServers()
             let serverTitles = (serverMenu?.items ?? []).map { $0.title }
+            // PET-LOCAL-FIXTURE-BEGIN
             try verify(serverTitles.first == "● Studio 已连接", "server-menu-connected")
             try verify(serverTitles.contains("○ Build 连不上"), "server-menu-offline")
+            // PET-LOCAL-FIXTURE-END
             var logoSources = Set((try await js("Array.from(document.querySelectorAll('.logo img')).filter(i => i.complete && i.naturalWidth > 0).map(i => i.getAttribute('src'))") as? [String]) ?? [])
             _ = try await js("document.querySelector('[data-machine=\"h1\"]').click()")
             try await Task.sleep(nanoseconds: 300_000_000)
