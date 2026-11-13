@@ -243,6 +243,68 @@ class CollectorChecks(unittest.TestCase):
         self.assertEqual((r[0]['prompt'], r[0]['followups'], r[0]['followupCount']),
                          ('主任务', ['追加一', '追加二'], 2))
 
+    def test_claude_transcript_keeps_a_third_queued_followup_with_the_lead(self):
+        rows = [
+            {'type':'user','uuid':'a','timestamp':self.now-300,'message':{'content':'主任务'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'a','state':'started','timestamp':self.now-300,
+             'session_id':'session-test'},
+            {'type':'user','uuid':'b','timestamp':self.now-200,'message':{'content':'追加一'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'b','state':'started','timestamp':self.now-180,
+             'session_id':'session-test'},
+            {'type':'user','uuid':'c','timestamp':self.now-100,'message':{'content':'追加二'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'c','state':'started','timestamp':self.now-90,
+             'session_id':'session-test'},
+            {'type':'user','uuid':'d','timestamp':self.now-20,'message':{'content':'追加三'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'d','state':'queued','timestamp':self.now-20,
+             'session_id':'session-test'},
+        ]
+        queue = [
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-300,'sessionId':'session-test','content':'主任务'},
+            {'type':'queue-operation','operation':'dequeue','timestamp':self.now-299,'sessionId':'session-test'},
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-200,'sessionId':'session-test','content':'追加一'},
+            {'type':'queue-operation','operation':'remove','timestamp':self.now-180,'sessionId':'session-test','content':'追加一','reason':'absorbed_mid_turn','commandUuid':'b'},
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-100,'sessionId':'session-test','content':'追加二'},
+            {'type':'queue-operation','operation':'remove','timestamp':self.now-90,'sessionId':'session-test','content':'追加二','reason':'absorbed_mid_turn','commandUuid':'c'},
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-20,'sessionId':'session-test','content':'追加三'},
+        ]
+        reader = self.claude_audit_with_transcript(rows, queue)
+        r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual((len(r), len(d), len(p)), (1, 0, 0))
+        self.assertEqual((r[0]['prompt'], r[0]['followups'], r[0]['followupCount']),
+                         ('主任务', ['追加二', '追加三'], 3))
+
+    def test_claude_repeated_prompt_text_keeps_a_later_dispatched_task(self):
+        rows = [
+            {'type':'user','uuid':'a','timestamp':self.now-3000,'message':{'content':'先改配置'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'a','state':'started','timestamp':self.now-3000,
+             'session_id':'session-test'},
+            {'type':'user','uuid':'b','timestamp':self.now-2900,'message':{'content':'继续'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'b','state':'started','timestamp':self.now-2880,
+             'session_id':'session-test'},
+            {'type':'result','user_message_uuid':'a','subtype':'success','timestamp':self.now-2800},
+            {'type':'user','uuid':'c','timestamp':self.now-120,'message':{'content':'继续'},
+             'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'c','state':'started','timestamp':self.now-120,
+             'session_id':'session-test'},
+        ]
+        queue = [
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-3000,'sessionId':'session-test','content':'先改配置'},
+            {'type':'queue-operation','operation':'dequeue','timestamp':self.now-3000,'sessionId':'session-test'},
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-2900,'sessionId':'session-test','content':'继续'},
+            {'type':'queue-operation','operation':'remove','timestamp':self.now-2880,'sessionId':'session-test','content':'继续','reason':'absorbed_mid_turn','commandUuid':'b'},
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-120,'sessionId':'session-test','content':'继续'},
+            {'type':'queue-operation','operation':'dequeue','timestamp':self.now-120,'sessionId':'session-test'},
+        ]
+        reader = self.claude_audit_with_transcript(rows, queue)
+        r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual(([i['prompt'] for i in r], d, p), (['继续'], [], []))
+
     def test_claude_transcript_dequeue_keeps_a_new_task_separate(self):
         rows = [
             {'type':'user','uuid':'a','timestamp':self.now-600,'message':{'content':'旧任务'},
@@ -305,8 +367,8 @@ class CollectorChecks(unittest.TestCase):
         r,d,p,_ = reader.collect(self.now, True)
         self.assertEqual(([i['prompt'] for i in d], [i['prompt'] for i in r]), ([], ['问题二']))
 
-    def test_error_turn_survives_a_later_prompt(self):
-        """出错的那轮不能因为后面又提问就被静默吞掉，否则真正的问题会被漏看。"""
+    def test_error_turn_is_retired_after_a_later_claude_prompt(self):
+        """Claude 同一会话继续开始新任务后，旧错误已经被处理，不再占位。"""
         reader = self.claude_audit_reader([
             {'type':'user','uuid':'u1','timestamp':self.now-900,'message':{'content':'出错的那轮'}},
             {'type':'command_lifecycle','command_uuid':'u1','state':'started','timestamp':self.now-900},
@@ -315,8 +377,7 @@ class CollectorChecks(unittest.TestCase):
             {'type':'command_lifecycle','command_uuid':'u2','state':'started','timestamp':self.now-100},
         ])
         r,d,p,_ = reader.collect(self.now, True)
-        self.assertEqual([i['prompt'] for i in p], ['出错的那轮'])
-        self.assertEqual(p[0]['state'], 'error')
+        self.assertEqual(([i['prompt'] for i in r], d, p), (['新问题'], [], []))
 
     def test_queued_message_does_not_retire_the_running_turn(self):
         """上一轮还没答完你就发的消息属于排队，不算“看过”，上一轮要保留。"""

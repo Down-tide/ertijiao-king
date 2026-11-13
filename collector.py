@@ -286,14 +286,17 @@ def prompt_time(turn):
 KEPT_AFTER_NEW_PROMPT = ('error', 'interrupted', 'blocked', 'unknown')
 
 
-def seen_by_new_prompt(turn, prompt_times):
+def seen_by_new_prompt(turn, prompt_times, dismiss_error=False):
     """You sent a new prompt in this conversation after this turn had finished: you have
     seen its result, so it leaves the panel, as on the servers (one task per session there).
 
-    Only successful turns are retired this way. An error, a stop or an unclear outcome
-    stays until you look at it: the next prompt is not proof that you read the failure.
+    Errors normally stay until you look at them. Claude is different when the next prompt
+    starts a new task in the same conversation: continuing there means the failed result
+    has been handled, so retire that old error with the new task. Stops and unclear
+    outcomes still stay until explicitly dealt with.
     """
-    if turn.get('state') in KEPT_AFTER_NEW_PROMPT:
+    state = turn.get('state')
+    if state in KEPT_AFTER_NEW_PROMPT and not (dismiss_error and state == 'error'):
         return False
     finished = turn['end'] or turn.get('soft_end') or 0
     return bool(finished) and any(a > finished for a in prompt_times)
@@ -548,9 +551,7 @@ def fold_claude_followups(turns, created, absorbed_ids=None, absorbed_prompts=No
     lead = None
     for t in order:
         if lead is not None:
-            # closed_at: a merged follow-up began executing, so the earlier run was over
-            # by then even if it never logged an end (one command runs at a time).
-            finish = lead['end'] or lead.get('soft_end') or lead.get('closed_at') or (
+            finish = lead['end'] or lead.get('soft_end') or (
                 float('inf') if lead.get('started_at') else lead['start'])
             made = created.get(t['id']) or t['start'] or 0
             # Ran by itself: it started after the earlier one truly ended (a result,
@@ -562,13 +563,17 @@ def fold_claude_followups(turns, created, absorbed_ids=None, absorbed_prompts=No
             # command belongs to the lead even if its timestamps look like a
             # new task; a normally dequeued command stays independent even if
             # the old audit command never logged an end.
-            absorbed = t['id'] in absorbed_ids or t.get('prompt', '') in absorbed_prompts
             dispatched_on_its_own = bool(t.get('prompt')) and any(
                 t.get('prompt') == prompt and sent and any(
                     when and abs(when - sent) <= 5
                     for when in (made, t.get('start') or 0, t.get('started_at') or 0)
                 )
                 for prompt, sent in dispatched)
+            # A command id is authoritative. Text is only a fallback for older
+            # queue rows without commandUuid, and an independently dequeued
+            # message must never be absorbed just because its text is repeated.
+            absorbed = t['id'] in absorbed_ids or (
+                t.get('prompt', '') in absorbed_prompts and not dispatched_on_its_own)
             if absorbed or (not dispatched_on_its_own and made <= finish and not ran_alone):
                 if not lead['end'] and t['end']:
                     # The earlier command finished without a result; the follow-up carries it.
@@ -576,8 +581,6 @@ def fold_claude_followups(turns, created, absorbed_ids=None, absorbed_prompts=No
                     lead.pop('soft_end', None)
                 elif not lead['end'] and t.get('soft_end'):
                     lead['soft_end'] = max(lead.get('soft_end') or 0, t['soft_end'])
-                if not lead['end'] and not lead.get('soft_end') and t.get('started_at'):
-                    lead['closed_at'] = min(lead.get('closed_at') or t['started_at'], t['started_at'])
                 # Your later message becomes a follow-up (追加) of this task, in order.
                 for value in [t.get('prompt', '')] + t.get('followups', []):
                     keep_first_prompt(lead, value)
@@ -843,7 +846,7 @@ class Reader:
                     # A resumed conversation supersedes prior interrupted/unknown turns.
                     if t is not latest_turn and not t.get('queued') and (not t['end'] or t['state'] in ('interrupted', 'unknown')):
                         continue
-                    if seen_by_new_prompt(t, prompt_times):
+                    if seen_by_new_prompt(t, prompt_times, dismiss_error=self.agent == 'claude'):
                         continue
                     target = {'type': 'url', 'value': 'codex://threads/'+info['id']} if self.agent == 'chatgpt' else {'type': 'app', 'value': {'claude':'com.anthropic.claudefordesktop', 'deepseek':'com.deepseek.dsh'}[self.agent]}
                     tid = 'codex:'+t['id'] if self.agent == 'chatgpt' else self.agent+':'+info['id']+':'+t['id']
