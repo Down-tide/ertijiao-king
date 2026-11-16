@@ -257,8 +257,9 @@ function runningRow(t) {
     <div class="row-meta">${resumedTag(t)}${machineBadge(t)}<b>${esc(label(t.agent))}</b><span>${elapsed(t.start)}</span>${detail}</div></div>
     <div class="spinner" aria-label="运行中"></div></div>`;
 }
-// 已中断：多数是你自己按了停止，不用处理；放在“已完成”里，灰色标签，不计入角标。
+// 非明确用户操作导致的中断仍保留在“已完成”里，便于发现异常；用户主动停止的记录由采集器收起。
 function isStopped(t) { return t.state === 'interrupted'; }
+function isUserInterrupted(t) { return t.userInterrupted === true; }
 function doneRow(t) {
   const stopped = isStopped(t);
   const tag = stopped ? '<span class="tag stopped">已中断</span>' : `<span class="tag ${esc(t.state)}">${STATE_TAG[t.state] || '完成'}</span>`;
@@ -327,10 +328,10 @@ function machineTasks(id) {
   const success = onMachine(state.done || [], id);
   return {
     running: onMachine(state.running || [], id),
-    pending: sortAttention(mine.filter((t) => !isStopped(t))),                     // 需处理：只有黄和红
-    success,
-    // 已完成 = 完成 + 已中断（灰），按时间排在一起。
-    done: success.concat(mine.filter(isStopped)).sort((a, b) => (b.time || 0) - (a.time || 0)),
+    pending: sortAttention(mine.filter((t) => !isStopped(t) && !isUserInterrupted(t))), // 需处理：只有黄和红
+    success: success.filter((t) => !isUserInterrupted(t)),
+    // 已完成 = 正常完成 + 未确认来源的中断（灰），按时间排在一起。
+    done: success.filter((t) => !isUserInterrupted(t)).concat(mine.filter((t) => isStopped(t) && !isUserInterrupted(t))).sort((a, b) => (b.time || 0) - (a.time || 0)),
   };
 }
 // 圆点：红 > 黄 > 绿 > 透明，只显示最严重的；有任务在跑时外面加一圈转动的蓝环。已中断不影响圆点。

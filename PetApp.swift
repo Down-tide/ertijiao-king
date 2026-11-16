@@ -683,8 +683,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     private var statusItem: NSStatusItem?
     private var sizeItems: [NSMenuItem] = []
     private var collectorHealthy = false
-    private var serverMenu: NSMenu?
-    private var servers: [[String: Any]] = []
     private var configFromDisk: [String: Any] = [:]
     /// config.json 读进来之前，设置页里是空表单；这时保存会把服务器列表清空，所以先不让存。
     private var configLoaded = false
@@ -716,13 +714,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         statusMenu.items.forEach { $0.target = self }
         statusMenu.items.last?.target = NSApp
         statusMenu.insertItem(sizeItem, at: 2)      // after 桌宠回到右下角; keeps its own targets
-        let servers = NSMenuItem(title: "服务器", action: nil, keyEquivalent: "")
-        let serverMenu = NSMenu()
-        serverMenu.addItem(withTitle: "正在读取状态…", action: nil, keyEquivalent: "")
-        servers.submenu = serverMenu
-        self.serverMenu = serverMenu
-        statusMenu.insertItem(servers, at: 3)
-        statusMenu.insertItem(.separator(), at: 4)
         item.menu = statusMenu
         statusItem = item
         #if !PET_TESTS
@@ -992,7 +983,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
         rawState = obj
         establishInitialBaselineIfNeeded()
-        updateServers()
         refresh()
     }
 
@@ -1021,6 +1011,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         let initial = Set(defaults.stringArray(forKey: "trackingInitialActiveIDs") ?? [])
         func eligible(_ item: [String: Any], terminal: Bool) -> Bool {
             let id = item["id"] as? String ?? ""
+            if item["userInterrupted"] as? Bool == true { return false }
             if dismissed.contains(id) { return false }
             if since == 0 { return true }
             if initial.contains(id) { return true }
@@ -1040,86 +1031,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         return s
     }
 
-    /// 服务器状态进了菜单栏：哪台连不上、最近一次成功读取是什么时候。
-    private func updateServers() {
-        servers = (rawState["hosts"] as? [[String: Any]]) ?? []
-        guard let menu = serverMenu else { return }
-        menu.removeAllItems()
-        if servers.isEmpty {
-            menu.addItem(withTitle: "没有配置服务器", action: nil, keyEquivalent: "")
-            return
-        }
-        for host in servers {
-            let label = host["label"] as? String ?? host["id"] as? String ?? "服务器"
-            let alias = host["alias"] as? String ?? ""
-            let status = host["status"] as? String ?? "offline"
-            let title: String
-            var tip = alias
-            switch status {
-            case "ok":
-                title = "● \(label) 已连接"
-                if let machine = host["machine"] as? String, !machine.isEmpty { tip += " · " + machine }
-                if let fetched = host["fetchedAt"] as? Double, fetched > 0 {
-                    tip += " · \(Self.age(fetched))更新"
-                }
-            case "pending":
-                title = "○ \(label) 正在连接"
-            case "stale":
-                title = "◐ \(label) 暂时连不上"
-                tip += " · " + (host["hint"] as? String ?? "保留着上次的数据")
-            default:
-                title = "○ \(label) 连不上"
-                tip += " · " + (host["hint"] as? String ?? "请检查 SSH 配置")
-            }
-            let item = NSMenuItem(title: title, action: #selector(openServerTerminal(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = alias
-            item.toolTip = tip
-            if status != "ok" { item.state = .off }
-            menu.addItem(item)
-        }
-        menu.addItem(.separator())
-        let check = NSMenuItem(title: "在终端里连过去", action: #selector(openServerTerminal(_:)), keyEquivalent: "")
-        check.target = self
-        check.representedObject = servers.first?["alias"] as? String ?? ""
-        check.isEnabled = !(check.representedObject as? String ?? "").isEmpty
-        menu.addItem(check)
-        let tipItem = NSMenuItem(title: "只读：不会在服务器上启动或停止任务", action: nil, keyEquivalent: "")
-        tipItem.isEnabled = false
-        menu.addItem(tipItem)
-    }
-
-    private static func age(_ stamp: Double) -> String {
-        let seconds = max(0, Date().timeIntervalSince1970 - stamp)
-        if seconds < 90 { return "刚刚" }
-        if seconds < 3600 { return "\(Int(seconds / 60)) 分钟前" }
-        return "\(Int(seconds / 3600)) 小时前"
-    }
-
-    @objc func openServerTerminal(_ sender: Any?) {
-        let alias: String
-        if let item = sender as? NSMenuItem, let value = item.representedObject as? String {
-            alias = value
-        } else {
-            alias = servers.first?["alias"] as? String ?? ""
-        }
-        guard !alias.isEmpty,
-              alias.range(of: "^[A-Za-z0-9_.:@%+-]{1,200}$", options: .regularExpression) != nil,
-              let url = URL(string: "ssh://" + alias) else {
-            webView.evaluateJavaScript("window.petOpenError()", completionHandler: nil)
-            showPanel()
-            return
-        }
-        NSWorkspace.shared.open(url)
-    }
-
     private func refresh() {
         let s = visibleState()
         let doneItems = (s["done"] as? [[String: Any]]) ?? []
         let running = (s["running"] as? [[String: Any]])?.count ?? 0
-        // 待处理里排除“已中断”：多数是你自己按的停止，不算要你处理（与面板一致）。
+        // 明确按下停止的任务由采集器直接收起；旧版状态也不计入待处理。
         let needYou = ((s["pending"] as? [[String: Any]]) ?? [])
-            .filter { ($0["state"] as? String) != "interrupted" }
+            .filter { ($0["state"] as? String) != "interrupted" && ($0["userInterrupted"] as? Bool) != true }
         let ids = Set(doneItems.compactMap { $0["id"] as? String })
         if let seen = seenDoneIDs, !ids.isSubset(of: seen) { petView.bounce() }
         seenDoneIDs = ids
@@ -1462,10 +1380,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
                           ["id": "h2", "label": "Build", "alias": "cpu-box", "status": "offline",
                            "hint": "SSH 连接失败", "fetchedAt": now - 900]],
                 "running": [["id": "test-run", "agent": "deepseek", "title": "正在整理项目资料", "prompt": "把本周实验结果汇总，列出接下来需要验证的内容", "start": now-180],
-                           ["id": "test-remote", "agent": "claude", "host": "h1", "title": "重构数据管线",
+                           ["id": "test-remote", "agent": "chatgpt", "host": "h1", "title": "重构数据管线",
                             "prompt": "把读取与清洗拆成两个模块", "start": now-600, "open": ["type": "terminal", "value": "gpu-box"]]],
-                "done": [["id": "test-done", "agent": "claude", "title": "本周总结已完成", "prompt": "请把实验记录整理成一份简短周报", "detail": "点击任务可打开对应应用", "time": now-60, "state": "success", "open": ["type": "app", "value": "invalid.test.app"]]],
-                "pending": [["id": "test-pending", "agent": "chatgpt", "host": "h2", "title": "等待确认的任务", "prompt": "帮我检查图标和动作 <img src=x onerror=alert(1)>", "followups": ["顺便看下日志 <img src=x onerror=alert(2)>"], "followupCount": 3, "detail": "任务已中断，可打开应用查看", "time": now-80, "state": "interrupted"]]
+                "done": [["id": "test-done", "agent": "claude", "title": "本周总结已完成", "prompt": "请把实验记录整理成一份简短周报 <img src=x onerror=alert(1)>", "followups": ["顺便看下日志 <img src=x onerror=alert(2)>"], "followupCount": 3, "detail": "点击任务可打开对应应用", "time": now-60, "state": "success", "open": ["type": "app", "value": "invalid.test.app"]]],
+                "pending": [["id": "test-pending", "agent": "chatgpt", "host": "h2", "title": "已主动中断的任务", "prompt": "帮我检查图标和动作", "detail": "已中断", "time": now-80, "state": "interrupted", "userInterrupted": true]]
             ]
             // PET-LOCAL-FIXTURE-END
             let fixture = rawState
@@ -1506,12 +1424,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify(offlineTag == "离线", "offline-machine-marked")
             // Hover text gives the real numbers; a machine with a running task never says "没有任务".
             let tips = try await js("Array.from(document.querySelectorAll('.mchip')).map(e => e.title)") as? [String] ?? []
-            try verify(tips.count == 4 && tips[2].hasSuffix("运行中 1") && tips.allSatisfy({ !$0.contains("没有任务") }), "machine-tooltip-counts")
+            try verify(tips.count == 4 && tips[2].hasSuffix("运行中 1") &&
+                       tips.prefix(3).allSatisfy({ !$0.contains("没有任务") }) &&
+                       tips[3].contains("没有任务"), "machine-tooltip-counts")
             let allRows = try await js("document.querySelectorAll('#list .row').length") as? Int
-            try verify(allRows == 4, "all-machines-shows-everything")
+            try verify(allRows == 3, "all-machines-shows-everything")
             let badges = try await js("Array.from(document.querySelectorAll('#list .host-badge')).map(e => e.textContent).sort().join(',')") as? String
             // PET-LOCAL-FIXTURE-BEGIN
-            try verify(badges == "Build,Local,Local,Studio", "all-machines-rows-name-their-machine")
+            try verify(badges == "Local,Local,Studio", "all-machines-rows-name-their-machine")
             // PET-LOCAL-FIXTURE-END
             _ = try await js("document.querySelector('[data-machine=\"__local__\"]').click()")
             try await Task.sleep(nanoseconds: 300_000_000)
@@ -1519,12 +1439,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify(macRows == 2, "mac-shows-only-its-tasks")
             let allCount = try await js("document.getElementById('cntAll').textContent.trim()") as? String
             try verify(allCount == "2", "all-count-per-machine")
-            // 角标 = 待查看的完成 + 需要你处理的；待确认那条也要算进去，否则会漏提醒。
+            let promptEscaped = try await js("document.querySelector('[data-view=\\\"test-done\\\"] .row-prompt')?.textContent.includes('<img src=x onerror=alert(1)>') == true && document.querySelector('[data-view=\\\"test-done\\\"] .row-prompt img') == null") as? Bool
+            try verify(promptEscaped == true, "prompt-previews-escaped-and-visible")
+            let followups = try await js("Array.from(document.querySelectorAll('[data-view=\\\"test-done\\\"] .followup')).map(e => e.textContent)") as? [String]
+            try verify(followups == ["追加顺便看下日志 <img src=x onerror=alert(2)>"], "followups-visible-and-escaped")
+            let followupNote = try await js("document.querySelector('[data-view=\\\"test-done\\\"] .followup-more')?.textContent") as? String
+            try verify(followupNote == "更早还有 2 条追加", "earlier-followups-counted")
+            // 角标 = 待查看的完成 + 需要你处理的；主动中断已经被收起。
             let badgeDone = (visibleState()["done"] as? [[String: Any]])?.count ?? 0
             let badgeNeed = ((visibleState()["pending"] as? [[String: Any]]) ?? [])
                 .filter { ($0["state"] as? String) != "interrupted" }.count
-            // 这份 fixture 里唯一那条待处理是「已中断」，按规则不算要你处理，
-            // 所以角标应该只数那 1 个完成项。
+            // 这份 fixture 里唯一的待处理是主动中断，已经不进入角标。
             try verify(badgeNeed == 0, "interrupted-is-not-need-you")
             // 运行中的提示只剩悬停气泡：没有底部的常驻标签，也没有右上角的旋转环。
             petView.update(done: 0, running: 2, needYou: 0)
@@ -1571,12 +1496,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify(backToList == true, "settings-toggles-closed")
             let gearIconOnly = try await js("document.querySelector('.gear').textContent.trim()") as? String
             try verify(gearIconOnly == "⚙", "settings-button-is-icon-only")
-            updateServers()
-            let serverTitles = (serverMenu?.items ?? []).map { $0.title }
-            // PET-LOCAL-FIXTURE-BEGIN
-            try verify(serverTitles.first == "● Studio 已连接", "server-menu-connected")
-            try verify(serverTitles.contains("○ Build 连不上"), "server-menu-offline")
-            // PET-LOCAL-FIXTURE-END
+            // 菜单栏里不再有「服务器」（连接状态在任务面板的机器标签里看）。
+            let topTitles = (statusItem?.menu?.items ?? []).map { $0.title }
+            try verify(!topTitles.contains("服务器"), "no-server-menu")
             var logoSources = Set((try await js("Array.from(document.querySelectorAll('.logo img')).filter(i => i.complete && i.naturalWidth > 0).map(i => i.getAttribute('src'))") as? [String]) ?? [])
             _ = try await js("document.querySelector('[data-machine=\"h1\"]').click()")
             try await Task.sleep(nanoseconds: 300_000_000)
@@ -1588,25 +1510,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             let hostNote = try await js("document.querySelectorAll('.host-note').length") as? Int
             try verify(hostNote == 1, "panel-shows-offline-note")
             let stoppedTag = try await js("document.querySelector('#list .tag')?.className") as? String
-            try verify(stoppedTag == "tag stopped", "interrupted-is-grey")
+            try verify(stoppedTag == nil, "user-interrupted-is-hidden")
             let attentionCount = try await js("document.getElementById('cntAttention').textContent.trim()") as? String
-            try verify(attentionCount == "", "grey-not-counted-as-needs-you")
-            // 已中断不用处理：它在“已完成”里（灰色），不在“需处理”里。
+            try verify(attentionCount == "", "user-interrupted-not-needs-you")
             let doneCount = try await js("document.getElementById('cntDone').textContent.trim()") as? String
-            try verify(doneCount == "1", "interrupted-listed-under-done")
-            let promptEscaped = try await js("document.querySelectorAll('.row-prompt').length === 1 && document.querySelectorAll('.row-prompt img').length === 0") as? Bool
-            try verify(promptEscaped == true, "prompt-previews-escaped-and-visible")
-            // 任务没答完时追加的提问也显示（最近两条 + 更早的条数），同样转义。
-            let followups = try await js("Array.from(document.querySelectorAll('#list .followup')).map(e => e.textContent)") as? [String]
-            try verify(followups == ["追加顺便看下日志 <img src=x onerror=alert(2)>"], "followups-visible-and-escaped")
-            let followupNote = try await js("document.querySelector('#list .followup-more')?.textContent") as? String
-            try verify(followupNote == "更早还有 2 条追加", "earlier-followups-counted")
+            try verify(doneCount == "", "user-interrupted-not-listed-under-done")
             logoSources.formUnion((try await js("Array.from(document.querySelectorAll('.logo img')).filter(i => i.complete && i.naturalWidth > 0).map(i => i.getAttribute('src'))") as? [String]) ?? [])
             try verify(logoSources.count == 3, "all-official-logos-loaded-offline")
             _ = try await js("document.querySelector('[data-machine=\"__all__\"]').click()")
             try await Task.sleep(nanoseconds: 300_000_000)
             let menuCount = statusItem?.menu?.items.count ?? 0
-            try verify(menuCount == 7, "recovery-menu")
+            try verify(menuCount == 5, "recovery-menu")     // 服务器菜单已移除：面板、回位、大小、分隔、退出
             // 窗口刚 orderFront 时偶尔还没被标记为可见，等一小会儿再判定；
             // 还不行就主动把面板提到前面一次，多半是测试环境里被别的窗口盖住了。
             if !(petWindow.isVisible && panel.isVisible) {

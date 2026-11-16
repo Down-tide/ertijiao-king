@@ -144,6 +144,18 @@ class CollectorChecks(unittest.TestCase):
         self.assertEqual((len(r),len(d),len(p)),(1,0,0))
         self.assertEqual(r[0]['prompt'],'继续处理图标')
 
+    def test_codex_user_interrupt_is_already_acknowledged(self):
+        path=self.base/'rollout.jsonl'
+        def event(kind, **args):
+            return {'type':'event_msg','timestamp':self.now-2,'payload':dict(type=kind,**args)}
+        self.write(path,[{'type':'session_meta','payload':{'id':'thread'}},
+            event('task_started',turn_id='a',started_at=self.now-30),
+            event('item_completed',turn_id='a',item={'type':'UserMessage','content':[{'type':'text','text':'跑一个长任务'}]}),
+            event('turn_aborted',turn_id='a',reason='interrupted')])
+        info=c.parse_codex(path)
+        self.assertTrue(info['turns']['a']['user_interrupted'])
+        self.assertEqual(c.Reader('chatgpt',self.base,'rollout.jsonl',c.parse_codex).collect(self.now,True)[:3], ([],[],[]))
+
     def test_deepseek_prompt_does_not_pick_runtime_or_permission_messages(self):
         reader=self.dsh([self.start(1,self.now-10),
             {'type':'user/message','data':{'source':{'kind':'user'},'content':[{'type':'text','text':'请修复任务面板'}]}},
@@ -326,6 +338,69 @@ class CollectorChecks(unittest.TestCase):
         r, d, p, _ = reader.collect(self.now, True)
         self.assertEqual([item['prompt'] for item in r], ['新任务'])
         self.assertEqual((d, p), ([], []))
+
+    def test_claude_multiple_command_transcripts_keep_new_task_separate(self):
+        """Claude 3p writes one queue journal per command session in one audit."""
+        root = self.base/'Claude-3p/local-agent-mode-sessions'
+        path = root/'sess/abcd1234/audit.jsonl'
+        rows = [
+            {'type':'user','uuid':'a','timestamp':self.now-600,
+             'message':{'content':'旧任务'},'session_id':'old-session'},
+            {'type':'command_lifecycle','command_uuid':'a','state':'started',
+             'timestamp':self.now-600,'session_id':'old-session'},
+            {'type':'user','uuid':'b','timestamp':self.now-200,
+             'message':{'content':'新任务'},'session_id':'new-session'},
+            {'type':'command_lifecycle','command_uuid':'b','state':'started',
+             'timestamp':self.now-190,'session_id':'new-session'},
+        ]
+        self.write(path, rows)
+        project = path.parent/'.claude/projects/session'
+        self.write(project/'old-session.jsonl', [
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-600,
+             'sessionId':'old-session','content':'旧任务'},
+            {'type':'queue-operation','operation':'dequeue','timestamp':self.now-599,
+             'sessionId':'old-session'},
+        ])
+        self.write(project/'new-session.jsonl', [
+            {'type':'queue-operation','operation':'enqueue','timestamp':self.now-200,
+             'sessionId':'new-session','content':'新任务'},
+            {'type':'queue-operation','operation':'dequeue','timestamp':self.now-190,
+             'sessionId':'new-session'},
+        ])
+        reader = c.Reader('claude', root, '*/*/audit.jsonl', c.parse_claude)
+        with patch.object(c, '_claude_code_running', return_value='running'):
+            r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual([item['prompt'] for item in r], ['新任务'])
+        self.assertEqual((d, p), ([], []))
+
+    def test_claude_stopped_worker_without_terminal_row_is_hidden(self):
+        root = self.base/'Claude-3p/local-agent-mode-sessions'
+        path = root/'sess/abcd1234/audit.jsonl'
+        self.write(path, [
+            {'type':'user','uuid':'u1','timestamp':self.now-60,
+             'message':{'content':'被停止的任务'}},
+            {'type':'command_lifecycle','command_uuid':'u1','state':'started',
+             'timestamp':self.now-60},
+        ])
+        reader = c.Reader('claude', root, '*/*/audit.jsonl', c.parse_claude)
+        with patch.object(c, '_claude_code_running', return_value='missing'):
+            r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual((r, d, p), ([], [], []))
+
+    def test_claude_worker_from_another_session_does_not_keep_task_running(self):
+        root = self.base/'Claude-3p/local-agent-mode-sessions'
+        path = root/'sess/abcd1234/audit.jsonl'
+        self.write(path, [
+            {'type':'user','uuid':'u1','session_id':'target-cli','timestamp':self.now-60,
+             'message':{'content':'被停止的任务'}},
+            {'type':'command_lifecycle','command_uuid':'u1','session_id':'target-cli',
+             'state':'started','timestamp':self.now-60},
+        ])
+        registry = path.parent/'.claude/sessions/other.json'
+        self.write(registry, [{'pid':os.getpid(),'sessionId':'other-cli','status':'busy'}])
+        reader = c.Reader('claude', root, '*/*/audit.jsonl', c.parse_claude)
+        r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual((r, d, p), ([], [], []))
 
     def test_unclosed_claude_command_does_not_swallow_later_tasks(self):
         # The first command never logs an end; its follow-up starts and finishes, then a new
@@ -534,8 +609,25 @@ class CollectorChecks(unittest.TestCase):
             {'type':'assistant','timestamp':self.now-20},
             {'type':'user','uuid':'x','timestamp':self.now-5,'message':{'content':[{'type':'text','text':'[Request interrupted by user]'}]}}])
         r,d,p,s=reader.collect(self.now,True)
-        self.assertEqual((len(r),len(d),len(p)),(0,0,1))
-        self.assertEqual((p[0]['state'],p[0]['prompt']),('interrupted','做一份周报'))
+        self.assertEqual((len(r),len(d),len(p)),(0,0,0))
+        info=c.parse_claude(self.base/'sess/abcd1234/audit.jsonl')
+        self.assertTrue(info['turns']['u1']['user_interrupted'])
+
+    def test_claude_companion_stop_marker_ends_turn_without_audit_marker(self):
+        rows = [
+            {'type':'user','uuid':'u1','timestamp':self.now-30,
+             'message':{'content':'做一份周报'},'session_id':'session-test'},
+            {'type':'command_lifecycle','command_uuid':'u1','state':'started',
+             'timestamp':self.now-30,'session_id':'session-test'},
+        ]
+        stop = {'type':'assistant','timestamp':self.now-5,'sessionId':'session-test',
+                'message':{'model':'<synthetic>','stop_reason':'stop_sequence',
+                           'content':[{'type':'text','text':'No response requested.'}]}}
+        reader = self.claude_audit_with_transcript(rows, [stop])
+        r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual((r, d, p), ([], [], []))
+        info = c.parse_claude(self.base/'sess/abcd1234/audit.jsonl')
+        self.assertTrue(info['turns']['u1']['user_interrupted'])
 
     def test_claude_finished_command_without_result_needs_confirmation_after_grace(self):
         reader=self.claude_audit([
@@ -629,7 +721,10 @@ class CollectorChecks(unittest.TestCase):
                 {'type':'command_lifecycle','command_uuid':'u1','state':'started','timestamp':self.now-60},
                 {'type':'command_lifecycle','command_uuid':'u1','state':state,'timestamp':self.now-1}])
             r,d,p,s=reader.collect(self.now,True)
-            self.assertEqual((len(r),p[0]['state']),(0,expected),state)
+            if state in ('stopped', 'user_cancelled'):
+                self.assertEqual((len(r),len(d),len(p)),(0,0,0),state)
+            else:
+                self.assertEqual((len(r),p[0]['state']),(0,expected),state)
 
     def test_claude_stop_does_not_hit_queued_command_behind_it(self):
         reader=self.claude_audit([
@@ -658,7 +753,7 @@ class CollectorChecks(unittest.TestCase):
         self.assertEqual(d[0]['detail'],'好了')
         odd=self.dsh([self.start(1,self.now-9),{'type':'turn/end','time':self.now*1000,'data':{'turn':1,'reason':{'kind':'aborted','reason':'user'}}}])
         r,d,p,s=odd.collect(self.now,True)
-        self.assertEqual((s,p[0]['state']),('ok','interrupted'))
+        self.assertEqual((s,len(p)),('ok',0))
 
     def test_prompt_is_the_users_first_question_of_the_turn(self):
         path=self.base/'rollout.jsonl'
@@ -683,6 +778,26 @@ class CollectorChecks(unittest.TestCase):
         self.assertEqual(c.prompt_preview('/Users/someone/Documents/notes/meeting_draft.md 帮我改成 PPT'),'…/meeting_draft.md 帮我改成 PPT')
         self.assertEqual(c.prompt_preview('\\*\\*注意：\\*\\*会弹窗'),'注意：会弹窗')
         self.assertEqual(c.prompt_preview('看 /tmp/a.png'),'看 /tmp/a.png')     # short paths stay
+
+    def test_codex_image_prompt_keeps_request_and_uses_safe_placeholder(self):
+        content = [
+            {'type': 'input_text', 'text': '\n# Files mentioned by the user:\n\n'
+             '## 截屏.png: /private/tmp/截屏.png\nImage attachment: true\n\n'
+             '## My request:\n报错了\n'},
+            {'type': 'input_text', 'text': '<image name=[Image #1] path="/private/tmp/截屏.png">'},
+            {'type': 'input_image', 'image_url': 'data:image/png;base64,omitted'},
+        ]
+        self.assertEqual(c.codex_prompt_preview(content), '报错了 【已上传图片】')
+        self.assertEqual(c.codex_prompt_preview([content[0], {'type': 'local_image', 'path': '/private/tmp/截屏.png'}]),
+                         '报错了 【已上传图片】')
+        self.assertEqual(c.codex_prompt_preview([
+            {'type': 'local_image', 'path': '/private/tmp/截屏.png'},
+            {'type': 'text', 'text': '[Image #1] 报错了'},
+        ]), '报错了 【已上传图片】')
+        self.assertEqual(c.codex_prompt_preview([{'type': 'input_text', 'text':
+            '# Files mentioned by the user:\n\n## report.pdf: /Users/me/report.pdf\n\n'
+            '## My request:\n请总结这份文件'}]),
+                         'Files mentioned by the user: report.pdf: …/report.pdf My request: 请总结这份文件')
 
     def test_stale_turn_logs_record_types_only(self):
         reader=self.claude_audit([
@@ -890,7 +1005,7 @@ class CollectorChecks(unittest.TestCase):
 
     def test_dsh_stop_and_error_details(self):
         stop=self.dsh([self.start(1,self.now-9),{'type':'turn/end','time':self.now*1000,'data':{'turn':1,'reason':{'kind':'aborted','reason':{'kind':'user'}}}}])
-        self.assertEqual(stop.collect(self.now,True)[2][0]['state'],'interrupted')
+        self.assertEqual(stop.collect(self.now,True)[2],[])
         closed=self.dsh([self.start(1,self.now-9),{'type':'turn/end','time':self.now*1000,'data':{'turn':1,'reason':{'kind':'aborted','reason':{'kind':'disposed'}}}}])
         self.assertEqual(closed.collect(self.now,True)[2][0]['detail'],'应用关闭时中断')
         err=self.dsh([self.start(1,self.now-9),{'type':'turn/end','time':self.now*1000,'data':{'turn':1,'reason':{'kind':'error','error':{'message':'No available channel'}}}}])

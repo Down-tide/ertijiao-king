@@ -102,6 +102,41 @@ def text_content(content):
     return ''
 
 
+# Keep this in step with collector.py: local and server Codex records use the
+# same image-upload wrapper, and the task panel should render them identically.
+CODEX_IMAGE_PLACEHOLDER = '【已上传图片】'
+CODEX_FILES_REQUEST = re.compile(
+    r'(?ms)^\s*# Files mentioned by the user:\s*.*?^\s*## My request:\s*(.*)$')
+CODEX_IMAGE_TAG = re.compile(r'<image\s+name=[^>]*>', re.I | re.S)
+CODEX_IMAGE_LABEL = re.compile(r'^\s*\[Image\s*#\d+\]\s*', re.I)
+
+
+def codex_image_content(content, raw=None):
+    """Whether a Codex message contains an uploaded image."""
+    raw = text_content(content) if raw is None else str(raw or '')
+    if isinstance(content, list) and any(
+        isinstance(part, dict) and part.get('type') in ('input_image', 'local_image')
+        for part in content
+    ):
+        return True
+    return bool(re.search(
+        r'(?ms)^\s*# Files mentioned by the user:\s*.*?\bImage attachment:\s*true\b'
+        r'.*?^\s*## My request:', raw))
+
+
+def codex_prompt_preview(content):
+    """Show a Codex prompt without the image upload wrapper or local path."""
+    raw = text_content(content)
+    if not codex_image_content(content, raw):
+        return prompt_preview(raw)
+    found = CODEX_FILES_REQUEST.search(raw)
+    request = found.group(1) if found else raw
+    request = CODEX_IMAGE_TAG.sub(' ', request)
+    request = CODEX_IMAGE_LABEL.sub('', request)
+    request = prompt_preview(request)
+    return (request + ' ' + CODEX_IMAGE_PLACEHOLDER).strip() if request else CODEX_IMAGE_PLACEHOLDER
+
+
 def json_lines(stream):
     for line in stream:
         if not line.endswith('\n'):
@@ -189,7 +224,7 @@ def _OPENS_TURN(row):
 
 def new_turn(tid, start=0):
     return {'id': str(tid), 'start': start, 'end': 0, 'state': 'running', 'detail': '',
-            'prompt': '', 'resumed': False, 'queued': False}
+            'prompt': '', 'resumed': False, 'queued': False, 'user_interrupted': False}
 
 
 FOLLOWUPS_KEPT = 2
@@ -297,12 +332,14 @@ def parse_codex(path):
         elif ev in ('turn_aborted', 'task_aborted'):
             turn = info['turns'].get(tid) if tid else latest
             if turn:
-                turn.update(end=ts, state='interrupted', detail='已中断')
+                user_stop = ev == 'turn_aborted' or p.get('reason') in ('user', 'cancelled', 'canceled')
+                turn.update(end=ts, state='interrupted', detail='已中断',
+                            user_interrupted=bool(turn.get('user_interrupted') or user_stop))
         elif ev == 'item_completed':
             item = p.get('item') or {}
             if item.get('type') == 'UserMessage':
                 raw = text_content(item.get('content'))
-                value = question_reply(raw) or prompt_preview(raw)
+                value = question_reply(raw) or codex_prompt_preview(item.get('content'))
                 if value:
                     clear_async_questions(info['turns'])
                 prompt = prompt or value
@@ -310,7 +347,7 @@ def parse_codex(path):
                 if turn:
                     keep_first_prompt(turn, value)
         elif ev == 'user_message':
-            value = question_reply(p.get('message')) or prompt_preview(p.get('message'))
+            value = question_reply(p.get('message')) or codex_prompt_preview(p.get('message'))
             if value:
                 clear_async_questions(info['turns'])
             prompt = prompt or value
@@ -379,6 +416,8 @@ def collect_codex(home, now, window, host):
         for turn in info['turns'].values():
             # A newer turn supersedes an older interrupted/unknown one.
             if turn is not latest and not turn.get('queued') and (not turn['end'] or turn['state'] in ('interrupted', 'unknown')):
+                continue
+            if turn.get('user_interrupted'):
                 continue
             # You asked again in this thread after it finished: you have seen it (as for Claude here).
             if turn['end'] and any(a > turn['end'] for a in asks):
@@ -527,6 +566,7 @@ def claude_tail(rows):
     """
     last_prompt = last_reply = last_row = 0
     end_turn = interrupt = failure = 0
+    user_interrupted = False
     replies = []
     current = None                          # exchange in flight: {'prompt', 'start', 'followups', ...}
     done = None                             # last finished exchange
@@ -562,6 +602,7 @@ def claude_tail(rows):
             text = text_content(content)
             if text.lstrip().startswith(INTERRUPT_MARKERS):
                 interrupt = max(interrupt, ts)
+                user_interrupted = True
                 if current is not None:
                     done, current = current, None
                 continue
@@ -595,6 +636,7 @@ def claude_tail(rows):
             'prompt_at': last_prompt, 'reply': (replies or [''])[-1],
             'replies': replies, 'reply_at': last_reply, 'end': end_turn,
             'interrupt': interrupt, 'failure': failure,
+            'user_interrupted': user_interrupted,
             'last': max(last_prompt, last_reply, last_row),
             'question': max(questions.values(), key=lambda q: q[1]) if questions else None}
 
@@ -686,6 +728,12 @@ def collect_claude(home, now, window, host):
         # The user asked after Claude last finished a reply: this turn is in flight.
         pending = tail['prompt_at'] > tail['end']
         state = ''
+        if (tail.get('user_interrupted') and tail['interrupt']
+                and tail['interrupt'] >= max(tail['end'], tail['prompt_at'])):
+            # The explicit user-stop marker wins over a stale "busy" registry
+            # row.  A stopped task is already acknowledged and must not return
+            # to the panel as a running item.
+            continue
         if tail['question'] and rec and rec['status'] != 'gone':
             # Claude asked you something (AskUserQuestion) and is waiting for the answer;
             # the registry may still say "busy", so the transcript decides.
@@ -693,6 +741,12 @@ def collect_claude(home, now, window, host):
         elif rec and rec['status'] in CLAUDE_WAITING:
             # Claude is blocked on you (permission prompt), even if the file is quiet.
             state, detail, end = 'waiting', '待批准：在服务器上批准或拒绝后才会继续', 0
+        elif (pending and rec and rec['status'] == 'idle'
+              and (not tail['interrupt'] or tail['interrupt'] >= tail['prompt_at'])
+              and (rec.get('statusAt') or 0) >= tail['prompt_at']):
+            # The remote worker has gone idle without an end row.  This is the
+            # server-side form of pressing Stop; it is already acknowledged.
+            continue
         elif rec and rec['status'] in CLAUDE_RUNNING:
             state, detail, end = 'running', '', 0
         elif tail['interrupt'] and tail['interrupt'] >= max(tail['end'], tail['prompt_at']):

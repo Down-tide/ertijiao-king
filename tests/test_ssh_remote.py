@@ -103,7 +103,7 @@ class ProbeChecks(unittest.TestCase):
             self.event('task_started', self.iso(2399), turn_id='a', started_at=self.now-60),
             self.event('turn_aborted', self.iso(2395), turn_id='a'),
         ])
-        self.assertEqual(self.collect()['items'][0]['state'], 'interrupted')
+        self.assertEqual(self.collect()['items'], [])
 
         self.codex_session('t-2', [
             self.event('task_started', self.iso(2399), turn_id='a', started_at=self.now-3*3600),
@@ -276,6 +276,24 @@ class ProbeChecks(unittest.TestCase):
         self.assertEqual([i['session'] for i in items], ['t-3'])
         self.assertEqual(items[0]['prompt'], '')
 
+    def test_codex_image_prompt_keeps_request_and_uses_safe_placeholder(self):
+        self.codex_session('t-image', [
+            self.event('task_started', self.iso(2399), turn_id='a', started_at=self.now-10),
+            self.event('item_completed', self.iso(2398), turn_id='a',
+                       item={'type': 'UserMessage', 'content': [
+                           {'type': 'input_text', 'text': '# Files mentioned by the user:\n\n'
+                            '## 截屏.png: /tmp/截屏.png\nImage attachment: true\n\n'
+                            '## My request:\n报错了\n'},
+                           {'type': 'input_text', 'text': '<image name=[Image #1] path="/tmp/截屏.png">'},
+                           {'type': 'input_image', 'image_url': 'data:image/png;base64,omitted'},
+                       ]}),
+        ])
+        self.assertEqual(self.collect()['items'][0]['prompt'], '报错了 【已上传图片】')
+        self.assertEqual(probe.codex_prompt_preview([
+            {'type': 'local_image', 'path': '/tmp/截屏.png'},
+            {'type': 'text', 'text': '[Image #1] 报错了'},
+        ]), '报错了 【已上传图片】')
+
     # ---- Claude Code -----------------------------------------------------
 
     def claude_session(self, sid, rows, pid=0, status='idle', name='实验分析'):
@@ -321,8 +339,26 @@ class ProbeChecks(unittest.TestCase):
             self.user('跑个长任务', 600),
             self.assistant('开始跑', 590),
             self.user('[Request interrupted by user]', 580)])
-        item = self.collect()['items'][0]
-        self.assertEqual((item['state'], item['prompt']), ('interrupted', '跑个长任务'))
+        self.assertEqual(self.collect()['items'], [])
+
+    @unittest.mock.patch.object(probe, 'pid_alive', return_value=True)
+    def test_user_interrupt_marker_wins_over_busy_registry(self, _alive):
+        self.claude_session('s-1', [
+            self.user('跑个长任务', 600),
+            self.assistant('开始跑', 590),
+            self.user('[Request interrupted by user]', 580)],
+            status='busy')
+        self.assertEqual(self.collect()['items'], [])
+
+    @unittest.mock.patch.object(probe, 'pid_alive', return_value=True)
+    def test_idle_registry_hides_pending_task_without_stop_row(self, _alive):
+        # Claude Code may only flip its registry back to idle when Stop is
+        # pressed; the transcript then has no terminal row at all.
+        self.claude_session('s-1', [
+            self.user('跑个长任务', 60),
+            self.assistant('开始跑', 50)],
+            status='idle')
+        self.assertEqual(self.collect()['items'], [])
 
     @unittest.mock.patch.object(probe, 'pid_alive', return_value=False)
     def test_killed_process_with_dead_registry_is_interrupted(self, _alive):
@@ -377,8 +413,7 @@ class ProbeChecks(unittest.TestCase):
              'message': {'role': 'user', 'content': [{'type': 'tool_result', 'content': 'ok'}]}},
             self.user('[Request interrupted by user]', 280),
         ])
-        item = self.collect()['items'][0]
-        self.assertEqual((item['state'], item['prompt']), ('interrupted', '做一份周报'))
+        self.assertEqual(self.collect()['items'], [])
 
     def test_claude_dead_pid_is_not_running(self):
         # 进程已经不在：注册表记录残留，不能据此一直显示运行中。
@@ -461,7 +496,7 @@ class ProbeChecks(unittest.TestCase):
     def test_claude_interrupt_still_counts_even_if_flagged_meta(self, _alive):
         stop = dict(self.user('[Request interrupted by user]', 280), isMeta=True)
         self.claude_session('s-1', [self.user('跑个长任务', 300), self.assistant('开始跑', 290), stop])
-        self.assertEqual(self.collect()['items'][0]['state'], 'interrupted')
+        self.assertEqual(self.collect()['items'], [])
 
     def codex_question(self, name, call, ago, title='用 A 还是 B？'):
         args = {'questions': [{'title': title, 'options': ['A', 'B']}]} if name.endswith('_async') else \

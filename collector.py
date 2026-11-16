@@ -30,6 +30,7 @@ except ImportError:
 WINDOW = 24 * 3600
 STALE = 30 * 60
 RESULT_GRACE = 60   # seconds to wait for a result row after a command is marked finished
+CLAUDE_PROCESS_GRACE = 10   # allow the Claude Code subprocess to start after its audit row
 LOOP_SECONDS = 3
 AGENT_LABELS = {'chatgpt': 'ChatGPT', 'claude': 'Claude', 'deepseek': 'DeepSeek Harness'}
 LOGGER = logging.getLogger('ai-pet.collector')
@@ -125,7 +126,8 @@ def text_content(content):
 
 
 def new_turn(tid, start=0):
-    return {'id': str(tid), 'start': start, 'end': 0, 'state': 'running', 'detail': '', 'prompt': '', 'resumed': False}
+    return {'id': str(tid), 'start': start, 'end': 0, 'state': 'running', 'detail': '', 'prompt': '',
+            'resumed': False, 'user_interrupted': False}
 
 
 def error_text(error):
@@ -154,6 +156,43 @@ def prompt_preview(text):
     text = re.sub(r'\\([*_`#>\[\]()~-])', r'\1', text)        # escaped markdown from pasted text
     text = LONG_PATH.sub(r'…/\1', text)                      # keep the file name, drop the long folder path
     return one_line(text, 120)
+
+
+# Codex adds this wrapper around an image upload. The image bytes and local
+# path are useful to Codex, but neither belongs in the task label shown here.
+CODEX_IMAGE_PLACEHOLDER = '【已上传图片】'
+CODEX_FILES_REQUEST = re.compile(
+    r'(?ms)^\s*# Files mentioned by the user:\s*.*?^\s*## My request:\s*(.*)$')
+CODEX_IMAGE_TAG = re.compile(r'<image\s+name=[^>]*>', re.I | re.S)
+CODEX_IMAGE_LABEL = re.compile(r'^\s*\[Image\s*#\d+\]\s*', re.I)
+
+
+def codex_image_content(content, raw=None):
+    """Whether a Codex message contains an uploaded image."""
+    raw = text_content(content) if raw is None else str(raw or '')
+    if isinstance(content, list) and any(
+        isinstance(part, dict) and part.get('type') in ('input_image', 'local_image')
+        for part in content
+    ):
+        return True
+    # Older event rows may retain only the rendered wrapper. Keep this strict so
+    # ordinary file/PDF mentions are not changed into image placeholders.
+    return bool(re.search(
+        r'(?ms)^\s*# Files mentioned by the user:\s*.*?\bImage attachment:\s*true\b'
+        r'.*?^\s*## My request:', raw))
+
+
+def codex_prompt_preview(content):
+    """Show a Codex prompt without the image upload wrapper or local path."""
+    raw = text_content(content)
+    if not codex_image_content(content, raw):
+        return prompt_preview(raw)
+    found = CODEX_FILES_REQUEST.search(raw)
+    request = found.group(1) if found else raw
+    request = CODEX_IMAGE_TAG.sub(' ', request)
+    request = CODEX_IMAGE_LABEL.sub('', request)
+    request = prompt_preview(request)
+    return (request + ' ' + CODEX_IMAGE_PLACEHOLDER).strip() if request else CODEX_IMAGE_PLACEHOLDER
 
 
 # Tools that stop the agent until you answer in the app (they are not approvals):
@@ -386,12 +425,16 @@ def parse_codex(path):
             elif ev in ('turn_aborted', 'task_aborted'):
                 t = info['turns'].get(tid) if tid else latest
                 if t:
-                    t.update(end=ts, state='interrupted', detail='已中断')
+                    # Codex writes turn_aborted when you press Stop. A task_aborted
+                    # without an explicit user reason may also be an app/process exit.
+                    user_stop = ev == 'turn_aborted' or p.get('reason') in ('user', 'cancelled', 'canceled')
+                    t.update(end=ts, state='interrupted', detail='已中断',
+                             user_interrupted=bool(t.get('user_interrupted') or user_stop))
             elif ev == 'item_completed':
                 item = p.get('item') or {}
                 if item.get('type') == 'UserMessage':
                     raw = text_content(item.get('content'))
-                    value = question_reply(raw) or prompt_preview(raw)
+                    value = question_reply(raw) or codex_prompt_preview(item.get('content'))
                     if value:
                         clear_async_questions(info['turns'])
                     prompt = prompt or value
@@ -399,7 +442,7 @@ def parse_codex(path):
                     if t:
                         keep_first_prompt(t, value)
             elif ev == 'user_message':
-                value = question_reply(p.get('message')) or prompt_preview(p.get('message'))
+                value = question_reply(p.get('message')) or codex_prompt_preview(p.get('message'))
                 if value:
                     clear_async_questions(info['turns'])
                 prompt = prompt or value
@@ -468,67 +511,84 @@ def _claude_queue_signals(audit_path, audit_session_ids):
     try:
         candidates = list(session_dir.glob('*.jsonl'))
     except OSError:
-        return set(), set(), []
+        return set(), set(), [], []
     if not candidates:
-        return set(), set(), []
+        return set(), set(), [], []
     ids = {str(value) for value in audit_session_ids if value}
     exact = [p for p in candidates if p.stem in ids]
-    if len(exact) == 1:
-        transcript = exact[0]
-    elif len(exact) > 1:
-        return set(), set(), []
+    if exact:
+        # A single audit can contain several Claude command sessions.  Each
+        # matching project transcript belongs to this audit; refusing to read
+        # them when there is more than one loses the dequeue evidence and makes
+        # a later, independently started task look like a follow-up to the
+        # first one.  Keep the older single-file fallback below for versions
+        # that did not write session_id into audit rows.
+        transcripts = sorted(exact, key=lambda p: str(p))
     elif len(candidates) == 1:
-        # Older Claude versions did not put a session id in audit rows.
-        transcript = candidates[0]
+        transcripts = candidates
     else:
         # Never combine queue operations from another conversation.
-        return set(), set(), []
+        return set(), set(), [], []
     try:
-        st = transcript.stat()
-        key = (str(transcript), st.st_ino, st.st_size, st.st_mtime_ns)
+        versions = []
+        for transcript in transcripts:
+            st = transcript.stat()
+            versions.append((str(transcript), st.st_ino, st.st_size, st.st_mtime_ns))
+        key = tuple(versions)
     except OSError:
-        return set(), set(), []
+        return set(), set(), [], []
     cached = _claude_queue_cache.get(key)
     if cached is not None:
         return cached
     # Drop old versions of this transcript after a rewrite and bound the
     # process-wide cache because audit files are discovered over many sessions.
+    paths = {version[0] for version in versions}
     for old_key in list(_claude_queue_cache):
-        if old_key[0] == str(transcript):
+        if paths.intersection(version[0] for version in old_key):
             _claude_queue_cache.pop(old_key, None)
-    absorbed_ids, absorbed_prompts, dispatched = set(), set(), []
+    absorbed_ids, absorbed_prompts, dispatched, stopped = set(), set(), [], []
     waiting = []
     try:
-        with transcript.open(encoding='utf-8', errors='replace') as f:
-            for row in json_lines(f):
-                if row.get('type') != 'queue-operation':
-                    continue
-                operation = row.get('operation')
-                when = stamp(row.get('timestamp'))
-                if operation == 'enqueue':
-                    value = prompt_preview(row.get('content') or row.get('prompt'))
-                    waiting.append((value, when))
-                elif operation == 'dequeue':
-                    if waiting:
-                        value, queued_at = waiting.pop(0)
+        for transcript in transcripts:
+            waiting = []
+            with transcript.open(encoding='utf-8', errors='replace') as f:
+                for row in json_lines(f):
+                    when = stamp(row.get('timestamp'))
+                    message = row.get('message') if isinstance(row.get('message'), dict) else {}
+                    if (row.get('type') == 'assistant'
+                            and message.get('model') == '<synthetic>'
+                            and message.get('stop_reason') == 'stop_sequence'
+                            and text_content(message.get('content')).strip() == 'No response requested.'):
+                        if when:
+                            stopped.append(when)
+                        continue
+                    if row.get('type') != 'queue-operation':
+                        continue
+                    operation = row.get('operation')
+                    if operation == 'enqueue':
+                        value = prompt_preview(row.get('content') or row.get('prompt'))
+                        waiting.append((value, when))
+                    elif operation == 'dequeue':
+                        if waiting:
+                            value, queued_at = waiting.pop(0)
+                            if value:
+                                dispatched.append((value, when or queued_at))
+                    elif operation == 'remove' and row.get('reason') == 'absorbed_mid_turn':
+                        command_id = row.get('commandUuid') or row.get('command_uuid')
+                        if command_id:
+                            absorbed_ids.add(str(command_id))
+                        value = prompt_preview(row.get('content') or row.get('prompt'))
                         if value:
-                            dispatched.append((value, when or queued_at))
-                elif operation == 'remove' and row.get('reason') == 'absorbed_mid_turn':
-                    command_id = row.get('commandUuid') or row.get('command_uuid')
-                    if command_id:
-                        absorbed_ids.add(str(command_id))
-                    value = prompt_preview(row.get('content') or row.get('prompt'))
-                    if value:
-                        absorbed_prompts.add(value)
-                    # The absorbed item leaves the queue; do not let a later
-                    # dequeue accidentally claim this old prompt.
-                    for index, (queued, _queued_at) in enumerate(waiting):
-                        if not value or queued == value:
-                            waiting.pop(index)
-                            break
+                            absorbed_prompts.add(value)
+                        # The absorbed item leaves the queue; do not let a later
+                        # dequeue accidentally claim this old prompt.
+                        for index, (queued, _queued_at) in enumerate(waiting):
+                            if not value or queued == value:
+                                waiting.pop(index)
+                                break
     except (OSError, UnicodeError, ValueError):
-        return set(), set(), []
-    result = (absorbed_ids, absorbed_prompts, dispatched)
+        return set(), set(), [], []
+    result = (absorbed_ids, absorbed_prompts, dispatched, stopped)
     _claude_queue_cache[key] = result
     while len(_claude_queue_cache) > _CLAUDE_QUEUE_CACHE_LIMIT:
         _claude_queue_cache.pop(next(iter(_claude_queue_cache)))
@@ -593,7 +653,7 @@ def fold_claude_followups(turns, created, absorbed_ids=None, absorbed_prompts=No
 
 
 def parse_claude(path):
-    info = {'id': path.parent.name, 'title': '', 'skip': False, 'turns': {}, 'tail': []}
+    info = {'id': path.parent.name, 'title': '', 'skip': False, 'turns': {}, 'tail': [], 'session_ids': []}
     active = None
     prompts = {}
     created = {}            # command id -> when you sent it
@@ -641,7 +701,7 @@ def parse_claude(path):
                             t.get('asks', {}).pop('q:' + str(part['tool_use_id']), None)
             if typ == 'user' and active is not None and not active['end'] and interrupt_marker(row):
                 # The SDK records a stop as a synthetic user message, often with no result row.
-                active.update(end=ts, state='interrupted', detail='已中断')
+                active.update(end=ts, state='interrupted', detail='已中断', user_interrupted=True)
             if typ == 'command_lifecycle' and row.get('command_uuid'):
                 tid = row['command_uuid']
                 t = info['turns'].setdefault(tid, new_turn(tid, ts))
@@ -656,7 +716,7 @@ def parse_claude(path):
                     t['queued'] = False
                     t.pop('soft_end', None)
                     if t['state'] == 'interrupted':
-                        t.update(end=0, state='running', detail='')
+                        t.update(end=0, state='running', detail='', user_interrupted=False)
                     if state == 'started':
                         t['start'] = ts
                 elif state in ('queued', 'pending'):
@@ -664,7 +724,9 @@ def parse_claude(path):
                 elif any(k in state for k in ('fail', 'error')):
                     t.update(end=ts, state='error', detail='任务出错')
                 elif any(k in state for k in ('cancel', 'abort', 'interrupt', 'stop', 'kill')):
-                    t.update(end=ts, state='interrupted', detail='已中断')
+                    user_stop = any(k in state for k in ('cancel', 'abort', 'interrupt', 'stop'))
+                    t.update(end=ts, state='interrupted', detail='已中断',
+                             user_interrupted=bool(t.get('user_interrupted') or user_stop))
                 elif state in ('completed', 'complete', 'finished', 'done', 'succeeded', 'success') and not t['end']:
                     # Success still requires a result row. If none follows within
                     # RESULT_GRACE, its outcome is unknown. Other states (e.g. waiting
@@ -682,8 +744,20 @@ def parse_claude(path):
                 state = 'error' if row.get('is_error') else 'interrupted' if reason in ('aborted', 'interrupted', 'cancelled') else 'success' if row.get('subtype') == 'success' else 'unknown'
                 t.update(end=ts, state=state, detail=one_line(row.get('result')) or {'success':'已完成', 'error':'任务出错', 'interrupted':'已中断', 'unknown':'回合结束，结果待确认'}[state])
                 active = t
-    absorbed_ids, absorbed_prompts, dispatched = _claude_queue_signals(path, audit_session_ids)
+    absorbed_ids, absorbed_prompts, dispatched, stopped = _claude_queue_signals(path, audit_session_ids)
+    # Claude's host loop records a user Stop in the companion transcript as a
+    # synthetic assistant message (“No response requested.”), while audit.jsonl
+    # may contain neither a result nor a lifecycle end row.  Associate each
+    # marker with the latest still-open command that had already started.
+    for when in sorted(stopped):
+        candidates = [t for t in info['turns'].values()
+                      if not t.get('end') and not t.get('queued')
+                      and (t.get('start') or 0) <= when]
+        if candidates:
+            t = max(candidates, key=lambda value: value.get('start') or 0)
+            t.update(end=when, state='interrupted', detail='已中断', user_interrupted=True)
     fold_claude_followups(info['turns'], created, absorbed_ids, absorbed_prompts, dispatched)
+    info['session_ids'] = sorted(audit_session_ids)
     for t in info['turns'].values():
         # When you sent it, not when it began running (a queued message waits for its turn).
         t['asked_at'] = created.get(t['id']) or t['start']
@@ -762,7 +836,10 @@ def parse_deepseek(path):
                         detail = '出错：' + error_text(why.get('error'))
                     elif reason == 'aborted' and cause.get('kind') == 'disposed':
                         detail = '应用关闭时中断'
-                    t.update(end=ts, state=state, detail=one_line(detail))
+                    user_interrupted = reason == 'aborted' and (
+                        cause.get('kind') == 'user' or why.get('reason') == 'user')
+                    t.update(end=ts, state=state, detail=one_line(detail),
+                             user_interrupted=bool(t.get('user_interrupted') or user_interrupted))
     info['title'] = info['title'] or 'DeepSeek 对话'
     return info
 
@@ -811,6 +888,10 @@ class Reader:
         if not self.root.is_dir():
             return running, done, pending, 'missing'
         titles = self.conversation_titles()
+        # Claude's desktop wrapper can leave a started command in audit.jsonl
+        # when its Code subprocess is stopped.  There is no terminal row to
+        # parse in that case; once the short startup grace has passed, the
+        # absence of the actual Code process is the reliable local signal.
         seen = set()
         for path in files:
             try:
@@ -839,6 +920,9 @@ class Reader:
                         if m.get('isArchived'):
                             continue
                         info = dict(info, id=m.get('sessionId') or info['id'], title=one_line(m.get('title'), 50) or 'Claude 任务')
+                claude_process_state = (_claude_code_running(path, info.get('session_ids', ()))
+                                        if self.agent == 'claude' and self.root.name == 'local-agent-mode-sessions'
+                                        else None)
                 started_turns = [t for t in info['turns'].values() if not t.get('queued')]
                 latest_turn = max(started_turns or list(info['turns'].values()), key=lambda t: t['start'])
                 prompt_times = [prompt_time(x) for x in info['turns'].values()]
@@ -847,6 +931,15 @@ class Reader:
                     if t is not latest_turn and not t.get('queued') and (not t['end'] or t['state'] in ('interrupted', 'unknown')):
                         continue
                     if seen_by_new_prompt(t, prompt_times, dismiss_error=self.agent == 'claude'):
+                        continue
+                    # Pressing Stop is already an acknowledgement. It should not
+                    # become another inbox item that asks you to dismiss it.
+                    if t.get('user_interrupted'):
+                        continue
+                    if (claude_process_state in ('missing', 'idle') and not t['end'] and not t.get('queued')
+                            and now - (t.get('start') or 0) >= CLAUDE_PROCESS_GRACE):
+                        # Pressing Stop is already an acknowledgement; do not
+                        # put this synthetic interruption into the panel.
                         continue
                     target = {'type': 'url', 'value': 'codex://threads/'+info['id']} if self.agent == 'chatgpt' else {'type': 'app', 'value': {'claude':'com.anthropic.claudefordesktop', 'deepseek':'com.deepseek.dsh'}[self.agent]}
                     tid = 'codex:'+t['id'] if self.agent == 'chatgpt' else self.agent+':'+info['id']+':'+t['id']
@@ -1222,6 +1315,8 @@ def split_remote(hosts):
     running, done, pending = [], [], []
     for host in hosts:
         for item in host.snapshot()['items']:
+            if item.get('userInterrupted'):
+                continue
             if item.get('state') == 'running':
                 running.append(item)
             elif item.get('state') == 'success':
@@ -1229,6 +1324,64 @@ def split_remote(hosts):
             else:
                 pending.append(item)
     return running, done, pending
+
+
+def _claude_code_running(audit_path=None, session_ids=()):
+    """Return the worker state for one local Claude audit.
+
+    Claude Desktop can have several local-agent sessions open at once.  The
+    worker registry is stored beside each audit (``.claude/sessions``), so a
+    process from another session must never keep this session marked running.
+    ``missing`` means the command worker has gone away; it is the signal used
+    for an unrecorded user Stop.  ``unknown`` is reserved for an unreadable
+    registry and is kept visible for safety.
+    """
+    if audit_path is None:
+        return 'unknown'
+    session_dir = Path(audit_path).parent / '.claude' / 'sessions'
+    wanted = {str(value) for value in session_ids if value}
+    try:
+        files = list(session_dir.glob('*.json'))
+    except OSError:
+        return 'unknown'
+    if not files:
+        return 'missing'
+    found = False
+    for path in files:
+        try:
+            with path.open(encoding='utf-8', errors='replace') as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or (wanted and str(rec.get('sessionId') or '') not in wanted):
+            continue
+        found = True
+        pid = rec.get('pid')
+        if not isinstance(pid, int) or not _process_alive(pid):
+            continue
+        status = str(rec.get('status') or '').lower()
+        if status in ('waiting', 'permission', 'blocked'):
+            return 'waiting'
+        if status in ('busy', 'running', 'working', 'requesting', 'compacting'):
+            return 'running'
+        if status in ('idle', 'stopped', 'exited', 'gone'):
+            return 'idle'
+        return 'unknown'
+    return 'missing' if found or files else 'unknown'
+
+
+def _process_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
 
 
 def running_apps():
