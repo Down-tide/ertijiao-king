@@ -1,4 +1,4 @@
-# 二踢脚大王
+# 二踢脚大王 v2.0
 
 <p align="center">
   <img src="public/docs/banner.jpg" width="830" alt="二踢脚大王 2.0 · 九套衣服">
