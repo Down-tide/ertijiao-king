@@ -306,13 +306,55 @@ final class PetView: NSView {
         CGRect(x: (PetView.size.width - PetView.avatarSize.width) / 2, y: 4,
                width: PetView.avatarSize.width, height: PetView.avatarSize.height)
     }
+
+    /// 站着的她在窗口里左右占到哪里（窗口宽度的比例）。窗口两边各有 55–110 pt 的透明区，
+    /// 拖到屏幕边上时按这里限制位置，人才能贴到屏幕边，而不是透明窗口贴边、人离边一大截。
+    /// 用 idle 量：别的姿势大多只比它宽一点；跳起举二踢脚那几秒会多伸出去一些，伸出屏幕也没关系。
+    private(set) var bodySpan: (min: CGFloat, max: CGFloat) = (min: 0, max: 1)
+
+    /// 图里不透明的部分左右占到哪里（0…1）。和 scripts/prepare_big_sprites.py 一样用 alpha ≥ 128，
+    /// 不把接地影子算进去。
+    static func opaqueSpan(_ image: CGImage) -> (min: CGFloat, max: CGFloat)? {
+        let w = image.width, h = image.height
+        guard w > 0, h > 0,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let data = ctx.data else { return nil }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let rowBytes = ctx.bytesPerRow
+        let px = data.bindMemory(to: UInt8.self, capacity: rowBytes * h)
+        var lo = w, hi = -1
+        for y in 0..<h {
+            let row = y * rowBytes
+            var x = 0
+            while x < lo { if px[row + x * 4 + 3] >= 128 { lo = x; break }; x += 1 }
+            x = w - 1
+            while x > hi { if px[row + x * 4 + 3] >= 128 { hi = x; break }; x -= 1 }
+        }
+        guard hi >= lo else { return nil }
+        return (min: CGFloat(lo) / CGFloat(w), max: CGFloat(hi + 1) / CGFloat(w))
+    }
+
+    /// 图的比例换算到窗口的比例（图按 resizeAspect 画在 avatarFrame 里）。
+    private func updateBodySpan(_ idle: CGImage?) {
+        guard let idle = idle, let s = PetView.opaqueSpan(idle) else { bodySpan = (min: 0, max: 1); return }
+        let a = avatarFrame
+        let drawn = CGFloat(idle.width) * min(a.width / CGFloat(idle.width), a.height / CGFloat(idle.height))
+        let left = a.midX - drawn / 2
+        bodySpan = (min: (left + s.min * drawn) / PetView.size.width,
+                    max: (left + s.max * drawn) / PetView.size.width)
+    }
+
     init(loader: @escaping (String) -> CGImage?) {
         loadSprite = loader
         super.init(frame: NSRect(origin: .zero, size: PetView.size))
         let root = CALayer()
         layer = root            // 自己管理图层树
         wantsLayer = true
-        buildLayers(root: root, image: sprite("idle"))
+        let idle = sprite("idle")
+        updateBodySpan(idle)
+        buildLayers(root: root, image: idle)
         motion.epoch = CACurrentMediaTime()
         motion.lastActivity = motion.epoch
         startFloating()
@@ -384,10 +426,25 @@ final class PetView: NSView {
     func say(_ text: String, seconds: TimeInterval = 3) {
         let size: CGFloat = 11.5
         let h: CGFloat = 24
-        let w = min(PetView.size.width - 8, textWidth(text, size: size) + 20)
+        var w = min(PetView.size.width - 8, textWidth(text, size: size) + 20)
+        // 气泡在人头顶居中。她贴着屏幕边时窗口有一部分在屏幕外：气泡挪到窗口在屏幕里的那一段，
+        // 放不下就缩窄（字尾变成 …），别被屏幕边切掉。
+        var lo: CGFloat = 4
+        var hi: CGFloat = PetView.size.width - 4          // 气泡能放的范围（窗口里，基础大小）
+        if let win = window, let vf = (win.screen ?? NSScreen.main)?.visibleFrame, scale > 0 {
+            lo = max(lo, (vf.minX + 4 - win.frame.minX) / scale)
+            hi = min(hi, (vf.maxX - 4 - win.frame.minX) / scale)
+        }
+        if hi - lo >= 40 {
+            w = min(w, hi - lo)
+        } else {                                           // 窗口几乎全在屏幕外（拖动途中）：照旧居中
+            lo = 4
+            hi = PetView.size.width - 4
+        }
+        let x = min(max((PetView.size.width - w) / 2, lo), hi - w)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        bubble.frame = CGRect(x: (PetView.size.width - w) / 2, y: PetView.size.height - h - 3, width: w, height: h)
+        bubble.frame = CGRect(x: x, y: PetView.size.height - h - 3, width: w, height: h)
         bubble.cornerRadius = h / 2
         bubbleText.string = text
         bubbleText.frame = CGRect(x: 8, y: (h - 15) / 2, width: w - 16, height: 15)
@@ -573,6 +630,7 @@ final class PetView: NSView {
         loadSprite = loader
         spriteCache = ["idle": idle]
         spriteOrder = ["idle"]
+        updateBodySpan(idle)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
@@ -845,6 +903,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         guard name != outfit else { return }
         outfit = name
         if petView != nil { petView.setOutfit(loader: outfitLoader(name)) }
+        // 换了衣服，人在窗口里的宽度也变了：贴着屏幕边时重新对齐一次。
+        if petWindow != nil, petWindow.isVisible {
+            let origin = clampedPetOrigin(petWindow.frame.origin)
+            if origin != petWindow.frame.origin {
+                petWindow.setFrameOrigin(origin)
+                defaults.set(NSStringFromPoint(origin), forKey: "petOrigin")
+            }
+        }
         outfitChanged()
         pushAvatar()
     }
@@ -1037,7 +1103,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         }
         guard let screen = NSScreen.screens.min(by: { distance($0) < distance($1) }) else { return defaultPetOrigin() }
         let f = screen.visibleFrame.insetBy(dx: 4, dy: 4)
-        return NSPoint(x: min(max(origin.x, f.minX), max(f.minX, f.maxX - size.width)),
+        // 左右按看得见的人限制，不按整个透明窗口：窗口两边的透明区可以伸到屏幕外，人能贴到屏幕边。
+        // 上下仍按整个窗口：头顶要留给气泡，脚下的影子本来就贴着窗口底边。
+        let span: (min: CGFloat, max: CGFloat) = petView?.bodySpan ?? (min: 0, max: 1)
+        let bodyLeft = size.width * span.min, bodyRight = size.width * span.max
+        // 取整：窗口落在整点上，存下来的位置读回来不会差一点点又被挪一次。
+        let minX = (f.minX - bodyLeft).rounded(.up), maxX = (f.maxX - bodyRight).rounded(.down)
+        return NSPoint(x: min(max(origin.x, minX), max(minX, maxX)),
                        y: min(max(origin.y, f.minY), max(f.minY, f.maxY - size.height)))
     }
     // MARK: 任务面板
@@ -1839,9 +1911,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify(!panel.isVisible && petWindow.isVisible, "close-keeps-pet")
             petClicked()
             try verify(panel.isVisible, "pet-reopens-panel")
+            // 位置按看得见的人限制：人在屏幕里，两边的透明区可以伸出去，人能贴到屏幕左右边。
+            func bodyRect() -> NSRect {
+                let f = petWindow.frame, s = petView.bodySpan
+                return NSRect(x: f.minX + f.width * s.min, y: f.minY, width: f.width * (s.max - s.min), height: f.height)
+            }
+            try verify(petView.bodySpan.min > 0.05 && petView.bodySpan.max < 0.95 && petView.bodySpan.min < petView.bodySpan.max,
+                       "body-span-measured-from-idle")
             petWindow.setFrameOrigin(NSPoint(x: -10000, y: -10000))
             petDragEnded()
-            try verify(NSScreen.screens.contains { $0.visibleFrame.contains(petWindow.frame) }, "drag-clamped-to-visible-screen")
+            try verify(NSScreen.screens.contains { $0.visibleFrame.contains(bodyRect()) }, "drag-clamped-to-visible-screen")
+            let edgeScreen = (petWindow.screen ?? NSScreen.main)!.visibleFrame
+            try verify(abs(bodyRect().minX - (edgeScreen.minX + 4)) <= 1 && petWindow.frame.minX < edgeScreen.minX,
+                       "drag-reaches-left-edge")
+            petWindow.setFrameOrigin(NSPoint(x: edgeScreen.maxX + 10000, y: edgeScreen.minY + 40))
+            petDragEnded()
+            let rightScreen = (petWindow.screen ?? NSScreen.main)!.visibleFrame
+            try verify(abs(bodyRect().maxX - (rightScreen.maxX - 4)) <= 1 && petWindow.frame.maxX > rightScreen.maxX,
+                       "drag-reaches-right-edge")
             try verify(savedPetOrigin() == petWindow.frame.origin, "saved-drag-position")
             _ = applicationShouldHandleReopen(NSApp, hasVisibleWindows: true)
             try verify(savedPetOrigin() == petWindow.frame.origin, "reopen-preserves-location")
