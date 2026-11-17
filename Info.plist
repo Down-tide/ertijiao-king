@@ -9,8 +9,8 @@
   <key>CFBundleIdentifier</key><string>io.github.down-tide.ai-pet</string>
   <key>CFBundleName</key><string>二踢脚大王</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>2.0.1</string>
-  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>2.0</string>
+  <key>CFBundleVersion</key><string>2</string>
   <!-- 设置与任务状态的保存目录：~/Library/Application Support/<PetDataDirectory> -->
   <key>PetDataDirectory</key><string>二踢脚大王</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
