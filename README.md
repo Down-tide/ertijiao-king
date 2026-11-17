@@ -1,6 +1,10 @@
 # 二踢脚大王
 
 <p align="center">
+  <img src="public/docs/banner.jpg" width="830" alt="二踢脚大王 2.0 · 九套衣服">
+</p>
+
+<p align="center">
   <img src="public/docs/pet.png" width="180" alt="桌宠">
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="public/docs/panel.png" width="360" alt="任务面板">
