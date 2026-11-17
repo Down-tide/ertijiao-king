@@ -2,6 +2,7 @@
 
 <p align="center">
   <img src="public/docs/pet.png" width="180" alt="桌宠">
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="public/docs/panel.png" width="360" alt="任务面板">
 </p>
 
