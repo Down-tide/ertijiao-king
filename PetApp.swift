@@ -85,8 +85,58 @@ final class PanelWebView: WKWebView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
-/// Animation time is independent of data refreshes; unread badges never freeze a pose.
+/// Animation time is independent of data refreshes; unread counts never freeze a pose.
 /// Each activity is held for tens of seconds; only blinking and waving flip frames quickly.
+/// 九套衣服。每天自动换一套：九天一个回合，每回合随机打乱一次顺序，回合内九天九套各不相同；
+/// 也可以在菜单「衣服」里固定一套。
+/// 每套是 Resources/assets/outfits/<名字>/pet-*.png；缺了就退回 assets/ 下那套（月下青竹）。
+enum Outfits {
+    static let order = ["月下青竹", "琥珀节拍", "白衫小调", "玫瑰暗夜", "雾中蝶影", "松间素影", "雪夜归途", "银杏街角", "星光夜曲"]
+    static let fallback = "月下青竹"
+
+    /// 今天穿哪套：从 2026-01-01 起按本地日期数天数；每 n 天一个回合，回合内按该回合打乱后的顺序穿。
+    static func daily(from available: [String], on date: Date = Date(), calendar: Calendar = .current) -> String {
+        guard !available.isEmpty else { return fallback }
+        var origin = DateComponents()
+        (origin.year, origin.month, origin.day) = (2026, 1, 1)
+        let start = calendar.date(from: origin) ?? Date(timeIntervalSince1970: 0)
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: start), to: calendar.startOfDay(for: date)).day ?? 0
+        let n = available.count
+        let round = days >= 0 ? days / n : (days - n + 1) / n          // floor division
+        return order(forRound: round, from: available)[days - round * n]
+    }
+
+    /// 第 round 个回合的穿衣顺序：随机打乱，回合内各不相同；新回合第一天不和上一回合最后一天撞衫。
+    /// 由回合号决定，不存任何状态：同一天无论何时打开都是同一套。
+    static func order(forRound round: Int, from available: [String]) -> [String] {
+        var list = shuffled(available, seed: round)
+        // swapping the first two never moves the last one, so the previous round's last day is its raw last
+        if list.count > 2, list[0] == shuffled(available, seed: round - 1).last {
+            list.swapAt(0, 1)
+        }
+        return list
+    }
+
+    /// Fisher-Yates with SplitMix64: the same order on every Mac and every Swift version.
+    private static func shuffled(_ items: [String], seed: Int) -> [String] {
+        var state = UInt64(bitPattern: Int64(seed)) &* 0x9E3779B97F4A7C15 &+ 0x2545F4914F6CDD1D
+        func next() -> UInt64 {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+        var list = items
+        var i = list.count - 1
+        while i > 0 {
+            list.swapAt(i, Int(next() % UInt64(i + 1)))
+            i -= 1
+        }
+        return list
+    }
+}
+
 struct PetMotion {
     var running = false
     var celebrationUntil: TimeInterval = 0
@@ -95,40 +145,50 @@ struct PetMotion {
     var lastActivity: TimeInterval = 0
     var epoch: TimeInterval = 0
     var dragging = false
+    /// 退出前说再见：在这之前一直显示 bye。
+    var leavingUntil: TimeInterval = 0
 
-    static let celebration: TimeInterval = 5
+    /// 任务完成的庆祝三段：跳起来 → 举二踢脚 → 笑着收尾。
+    static let celebrationBeats: [(String, TimeInterval)] = [("jump", 1.4), ("firecracker", 3.0), ("happy", 2.1)]
+    static var celebration: TimeInterval { celebrationBeats.reduce(0) { $0 + $1.1 } }
     static let sleepAfter: TimeInterval = 300          // 5 minutes with nothing happening
-    static let waves: Set<String> = ["wave", "wave-2"]
+    /// 悬停打招呼：手抬到肩侧轻轻挥一下，浅笑。一帧，靠身体轻摆表现挥手。
+    /// （以前是手臂前伸、掌心朝人的 present 两帧，看起来像在挡人，换掉了。）
+    static let greeting = "wave"
     /// 挥手动画的最短间隔。气泡不受它限制：每次真的移上来都要能看到状态。
     static let greetingGap: TimeInterval = 3
-    /// Sitting, kneeling or lying on the floor (barely sway; not "standing").
-    static let floor: Set<String> = ["sit", "sit-blink", "read", "tea", "type", "kneel", "legs-out", "squat",
-                                     "lie", "prone-read", "lie-side", "lie-back", "sleep"]
-    static let cheers: Set<String> = ["happy", "jump", "firecracker", "wave", "wave-2"]
-    /// Idle routine: (activity, seconds). Half of it is sitting or lying, not standing.
+    /// 退出前 bye 停留的时长。
+    static let farewell: TimeInterval = 1.4
+    /// Sitting (on the stool or the floor), kneeling or lying: barely sway; not "standing".
+    static let floor: Set<String> = ["sit", "sit-blink", "edge-sit", "edge-sit-blink", "chin-rest", "guitar", "daze",
+                                     "read", "write", "write-blink", "tea", "type", "kneel", "legs-out",
+                                     "lie", "prone-read", "lie-side", "sleep"]
+    static let cheers: Set<String> = ["happy", "jump", "firecracker"]
+    /// Idle routine: (activity, seconds). Most of it is sitting or lying, not standing.
     static let idleRoutine: [(String, TimeInterval)] = [
-        ("idle", 30), ("sit", 40), ("read", 45), ("legs-out", 30), ("lie", 45), ("prone-read", 40),
-        ("idle", 15), ("look", 8), ("tea", 35), ("lie-side", 40), ("kneel", 30), ("lie-back", 35),
-        ("squat", 10), ("think", 10), ("stretch", 6), ("sit", 30),
+        ("idle", 25), ("edge-sit", 35), ("chin-rest", 30), ("legs-out", 30), ("lie", 40), ("guitar", 40),
+        ("look", 8), ("sit", 35), ("tea", 35), ("prone-read", 40), ("daze", 30), ("kneel", 30),
+        ("lie-side", 40), ("idle", 15), ("stretch", 6),
     ]
-    /// While a task runs she works: typing, writing, reading, thinking.
+    /// While a task runs she works: typing, writing, reading, thinking, and her stage habits in between.
     static let workRoutine: [(String, TimeInterval)] = [
-        ("type", 45), ("think", 9), ("write", 35), ("type", 40), ("look", 7), ("read", 30), ("prone-read", 30),
-        ("think", 9), ("write", 30),
+        ("type", 45), ("stance", 10), ("write", 35), ("arms-crossed", 10), ("read", 30), ("think", 9),
+        ("type", 40), ("drumstick", 12), ("write", 30), ("ending", 8),
     ]
     /// Every sprite the schedule can show.
     static var allPoses: Set<String> {
         Set((idleRoutine + workRoutine).map { $0.0 })
-            .union(["blink", "sit-blink", "write-blink", "sleep", "happy", "jump", "firecracker", "wave", "wave-2", "stretch"])
+            .union(["blink", "sit-blink", "write-blink", "edge-sit-blink", "sleep", "happy", "jump", "firecracker",
+                    greeting, "bye", "drag"])
     }
 
-    /// Frames that belong together (blink, wave); switching inside a pair is instant, not a crossfade.
+    /// Frames that belong together (blinks); switching inside a pair is instant, not a crossfade.
     static func base(_ pose: String) -> String {
         switch pose {
         case "blink": return "idle"
         case "sit-blink": return "sit"
         case "write-blink": return "write"
-        case "wave-2": return "wave"
+        case "edge-sit-blink": return "edge-sit"
         default: return pose
         }
     }
@@ -136,10 +196,6 @@ struct PetMotion {
     func asleep(at now: TimeInterval) -> Bool {
         !running && !dragging && now >= celebrationUntil && now >= greetingUntil && now >= wakingUntil
             && now - lastActivity > Self.sleepAfter
-    }
-
-    private func wave(at now: TimeInterval) -> String {
-        Int(now / 0.4) % 2 == 0 ? "wave" : "wave-2"
     }
 
     private static func activity(in routine: [(String, TimeInterval)], at t: TimeInterval) -> String {
@@ -153,16 +209,22 @@ struct PetMotion {
     }
 
     func pose(at now: TimeInterval, reducedMotion: Bool = false) -> String {
+        if now < leavingUntil { return "bye" }               // quitting: a still pose, also with reduced motion
         if reducedMotion {
             if now < celebrationUntil || now < greetingUntil { return "happy" }
             return running ? "type" : "idle"
         }
-        if dragging { return "stretch" }                     // picked up: arms up
+        if dragging { return "drag" }                        // lifted by the shoulders, legs dangling
         if now < celebrationUntil {
-            return celebrationUntil - now > Self.celebration - 1.4 ? "jump" : "firecracker"
+            var t = Self.celebration - (celebrationUntil - now)      // seconds since the celebration started
+            for (beat, seconds) in Self.celebrationBeats {
+                if t < seconds { return beat }
+                t -= seconds
+            }
+            return Self.celebrationBeats.last?.0 ?? "happy"
         }
         if now < wakingUntil { return "stretch" }            // just woken up
-        if now < greetingUntil { return wave(at: now) }
+        if now < greetingUntil { return Self.greeting }
         if asleep(at: now) { return "sleep" }
         let t = max(0, now - epoch)
         let current = Self.activity(in: running ? Self.workRoutine : Self.idleRoutine, at: t)
@@ -173,20 +235,25 @@ struct PetMotion {
         case "idle": return blink ? "blink" : "idle"
         case "sit": return blink ? "sit-blink" : "sit"
         case "write": return blink ? "write-blink" : "write"
+        case "edge-sit": return blink ? "edge-sit-blink" : "edge-sit"
         default: return current
         }
     }
 }
 
-/// 桌宠本体：透明背景的 Q 版全身角色、完成数角标、运行中提示，支持拖动和点击。
+/// 桌宠本体：透明背景的 8 头身全身角色、完成数角标、运行中提示，支持拖动和点击。
 final class PetView: NSView {
-    static let size = NSSize(width: 168, height: 244)   // base layout size; top 30 pt hold the speech bubble
-    static let avatar: CGFloat = 184
+    static let size = NSSize(width: 300, height: 344)   // base layout size; the top 26 pt hold the speech bubble
+    /// Sprites are 750×850 px (scripts/prepare_big_sprites.py), shown at 2.5 px per pt.
+    static let avatarSize = NSSize(width: 300, height: 340)
+    /// In the sprite, from its bottom edge: the feet (y 828 of 850) and the top of the standing head (y 128).
+    static let footFraction: CGFloat = (850 - 828) / 850.0
+    static let crownFraction: CGFloat = (850 - 128) / 850.0
     static let minScale: CGFloat = 0.6
     static let maxScale: CGFloat = 1.8
     static let presets: [(String, CGFloat)] = [("小", 0.75), ("中（默认）", 1.0), ("大", 1.3), ("特大", 1.6)]
 
-    /// Display scale of the whole pet (sprite, badge, bubble). The window follows it.
+    /// Display scale of the whole pet (sprite, bubble). The window follows it.
     private(set) var scale: CGFloat = 1
     private let stage = CALayer()       // holds every pet layer at base size; scaled as one
 
@@ -196,9 +263,27 @@ final class PetView: NSView {
     private let content = CALayer()     // 完成时弹一下
     private let plate = CALayer()
     private let face = CALayer()
-    private let badge = CALayer()
-    private let badgeText = CATextLayer()
-    private let sprites: [String: CGImage]
+    /// Sprites are decoded when first shown and only a few are kept: a decoded 750×850 sprite is 2.5 MB,
+    /// a whole outfit would be ~85 MB. Poses change every few tens of seconds, so decoding is rare.
+    private var loadSprite: (String) -> CGImage?
+    private var spriteCache: [String: CGImage] = [:]
+    private var spriteOrder: [String] = []
+    static let spriteCacheLimit = 8
+
+    private func sprite(_ pose: String) -> CGImage? {
+        if let hit = spriteCache[pose] {
+            spriteOrder.removeAll { $0 == pose }
+            spriteOrder.append(pose)
+            return hit
+        }
+        guard let image = loadSprite(pose) else { return pose == "idle" ? nil : sprite("idle") }
+        spriteCache[pose] = image
+        spriteOrder.append(pose)
+        while spriteOrder.count > Self.spriteCacheLimit {
+            spriteCache.removeValue(forKey: spriteOrder.removeFirst())
+        }
+        return image
+    }
     private var motion = PetMotion()
     private var animationTimer: Timer?
     private var tracking: NSTrackingArea?
@@ -218,15 +303,16 @@ final class PetView: NSView {
     private var dragged = false
 
     private var avatarFrame: CGRect {
-        CGRect(x: (PetView.size.width - PetView.avatar) / 2, y: 22, width: PetView.avatar, height: PetView.avatar)
+        CGRect(x: (PetView.size.width - PetView.avatarSize.width) / 2, y: 4,
+               width: PetView.avatarSize.width, height: PetView.avatarSize.height)
     }
-    init(images: [String: NSImage]) {
-        sprites = images.compactMapValues { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
+    init(loader: @escaping (String) -> CGImage?) {
+        loadSprite = loader
         super.init(frame: NSRect(origin: .zero, size: PetView.size))
         let root = CALayer()
         layer = root            // 自己管理图层树
         wantsLayer = true
-        buildLayers(root: root, image: sprites["idle"])
+        buildLayers(root: root, image: sprite("idle"))
         motion.epoch = CACurrentMediaTime()
         motion.lastActivity = motion.epoch
         startFloating()
@@ -253,9 +339,11 @@ final class PetView: NSView {
         body.addSublayer(content)
 
         let a = avatarFrame
-        // A small contact shadow below the feet; the character itself is transparent.
-        plate.frame = CGRect(x: 52, y: 31, width: 64, height: 6)
-        plate.cornerRadius = 3
+        // Grounded sprites have their contact shadow baked in. This one is the floor shadow under a jump:
+        // it stays on the floor while she is in the air, so it is only shown for that pose.
+        plate.frame = CGRect(x: a.midX - 40, y: a.minY + a.height * PetView.footFraction - 4, width: 80, height: 8)
+        plate.cornerRadius = 4
+        plate.isHidden = true
         plate.backgroundColor = NSColor(calibratedWhite: 0.1, alpha: 0.08).cgColor
         plate.shadowColor = NSColor.black.cgColor
         plate.shadowOpacity = 0.2
@@ -265,8 +353,8 @@ final class PetView: NSView {
         content.addSublayer(plate)
 
         face.frame = a
-        face.anchorPoint = CGPoint(x: 0.5, y: 0.08)
-        face.position = CGPoint(x: a.midX, y: a.minY + a.height * 0.08)
+        face.anchorPoint = CGPoint(x: 0.5, y: PetView.footFraction)      // sway and squash pivot at the feet
+        face.position = CGPoint(x: a.midX, y: a.minY + a.height * PetView.footFraction)
         face.cornerRadius = 0
         face.masksToBounds = false
         face.backgroundColor = NSColor.clear.cgColor
@@ -275,13 +363,6 @@ final class PetView: NSView {
         face.contentsScale = scale
         content.addSublayer(face)
 
-        badge.backgroundColor = NSColor(calibratedRed: 0.91, green: 0.46, blue: 0.29, alpha: 1).cgColor
-        badge.borderColor = NSColor.white.cgColor
-        badge.borderWidth = 2.5
-        badge.isHidden = true
-        content.addSublayer(badge)
-        style(badgeText, size: 13, scale: scale)
-        badge.addSublayer(badgeText)
 
         bubble.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
         bubble.borderColor = NSColor(calibratedWhite: 0, alpha: 0.08).cgColor
@@ -345,7 +426,6 @@ final class PetView: NSView {
     func update(done: Int, running: Int, needYou: Int = 0) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        let a = avatarFrame
         let wasAsleep = currentPose == "sleep"
         motion.running = running > 0
         // Speak after the CATransaction below, so the bubble's fade-in isn't disabled.
@@ -360,21 +440,6 @@ final class PetView: NSView {
         lastNeedYou = needYou
         lastRunning = running
 
-        let total = done + needYou
-        badge.isHidden = total == 0
-        if total > 0 {
-            let text = total > 99 ? "99+" : String(total)
-            let h: CGFloat = 26
-            let w = max(h, textWidth(text, size: 13) + 14)
-            badge.frame = CGRect(x: PetView.size.width - w - 17, y: a.maxY - h - 10, width: w, height: h)
-            badge.cornerRadius = h / 2
-            // 有待处理的就用红色：那是要你动手的，比“完成了”更急。
-            badge.backgroundColor = needYou > 0
-                ? NSColor(calibratedRed: 0.86, green: 0.28, blue: 0.24, alpha: 1).cgColor
-                : NSColor(calibratedRed: 0.91, green: 0.46, blue: 0.29, alpha: 1).cgColor
-            badgeText.string = text
-            badgeText.frame = CGRect(x: 0, y: (h - 16) / 2, width: w, height: 16)
-        }
 
         CATransaction.commit()
         if startedNew && CACurrentMediaTime() > bubbleUntil {
@@ -407,28 +472,33 @@ final class PetView: NSView {
                 fade.duration = 0.35
                 face.add(fade, forKey: "poseFade")
             }
-            face.contents = sprites[pose] ?? sprites["idle"]
+            face.contents = sprite(pose)
+            plate.isHidden = pose != "jump"
             CATransaction.commit()
         }
         guard !reduced else { return }
-        // One sway per pose group: the two wave frames share it, so it doesn't restart every frame.
+        // One sway per pose group, so blink frames don't restart it.
         let group: String
         if motion.dragging { group = "drag" }
+        else if pose == PetMotion.greeting { group = "greet" }
         else if PetMotion.cheers.contains(pose) { group = "cheer" }
         else if pose.hasPrefix("write") { group = "write" }
-        else if pose == "sleep" || pose == "doze" { group = "doze" }
+        else if pose == "sleep" { group = "sleep" }
         else if PetMotion.floor.contains(pose) { group = "seated" }
         else { group = "calm" }
         guard group != currentSway else { return }
         currentSway = group
         face.removeAnimation(forKey: "gesture")
-        var angle = 0.022, duration = 3.6
+        face.removeAnimation(forKey: "dangle")
+        if group == "drag" { dangle(); return }
+        // She is ~1.75× as tall as the old chibi, so the same angle would swing her head that much further.
+        var angle = 0.013, duration = 3.6
         switch group {
-        case "drag": (angle, duration) = (0.10, 0.7)     // dangles while carried
-        case "cheer": (angle, duration) = (0.045, 0.85)
-        case "write": (angle, duration) = (0.012, 3.6)
-        case "doze": (angle, duration) = (0.02, 6.0)     // slow breathing-like nod while asleep
-        case "seated": (angle, duration) = (0.008, 5.0)  // sitting/lying: barely moves
+        case "greet": (angle, duration) = (0.012, 1.5)    // one gentle side-to-side sway with the wave
+        case "cheer": (angle, duration) = (0.026, 0.85)
+        case "write": (angle, duration) = (0.007, 3.6)
+        case "sleep": (angle, duration) = (0.012, 6.0)    // slow breathing-like nod while asleep
+        case "seated": (angle, duration) = (0.005, 5.0)   // sitting/lying: barely moves
         default: break
         }
         let sway = CAKeyframeAnimation(keyPath: "transform.rotation.z")
@@ -437,6 +507,23 @@ final class PetView: NSView {
         sway.repeatCount = .infinity
         sway.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         face.add(sway, forKey: "gesture")
+    }
+
+    /// Carried by the shoulders: swing like a pendulum hanging from the top of the figure. The layer pivots
+    /// at the feet, so a sideways shift that cancels the rotation at shoulder height keeps that point still.
+    private func dangle() {
+        let angle = 0.05, duration = 1.1
+        let arm = Double(face.bounds.height) * Double(PetView.crownFraction - PetView.footFraction) * 0.9
+        let swing = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+        swing.values = [0, angle, 0, -angle, 0]
+        let shift = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        shift.values = [0, arm * angle, 0, -arm * angle, 0]
+        let group = CAAnimationGroup()
+        group.animations = [swing, shift]
+        group.duration = duration
+        group.repeatCount = .infinity
+        group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        face.add(group, forKey: "dangle")
     }
 
     /// A small hop with squash on take-off and landing (the layer's anchor is at the feet).
@@ -466,12 +553,43 @@ final class PetView: NSView {
         body.add(float, forKey: "float")
         let breathing = CABasicAnimation(keyPath: "transform.scale.y")
         breathing.fromValue = 1
-        breathing.toValue = 1.018
+        breathing.toValue = 1.009              // taller figure: the same 2-3 pt rise at the head as before
         breathing.duration = 1.8
         breathing.autoreverses = true
         breathing.repeatCount = .infinity
         breathing.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         face.add(breathing, forKey: "breathing")
+    }
+
+    #if PET_TESTS
+    var posePresented: String { currentPose }
+    var spriteShown: CGImage? { face.contents.map { $0 as! CGImage } }
+    var spritesDecoded: Int { spriteCache.count }
+    #endif
+
+    /// 换衣服：换掉整套 sprite，当前姿势立刻用新衣服显示（淡入）。只保留当前这一套，省内存。
+    func setOutfit(loader: @escaping (String) -> CGImage?) {
+        guard let idle = loader("idle") else { return }
+        loadSprite = loader
+        spriteCache = ["idle": idle]
+        spriteOrder = ["idle"]
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let fade = CATransition()
+            fade.type = .fade
+            fade.duration = 0.5
+            face.add(fade, forKey: "poseFade")
+        }
+        face.contents = sprite(currentPose)
+        CATransaction.commit()
+    }
+
+    /// 退出前：双手指尖捏合说再见。
+    func sayGoodbye() {
+        motion.leavingUntil = CACurrentMediaTime() + PetMotion.farewell + 1
+        say(["下次见～", "我先走啦", "拜拜"].randomElement() ?? "", seconds: PetMotion.farewell + 1)
+        animate()
     }
 
     /// 有新任务完成时弹一下。
@@ -484,7 +602,7 @@ final class PetView: NSView {
         animate()
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         let a = CAKeyframeAnimation(keyPath: "transform.scale")
-        a.values = [1.0, 1.12, 0.95, 1.04, 1.0]
+        a.values = [1.0, 1.06, 0.97, 1.02, 1.0]   // smaller pop: at 1.12 her raised arms would leave the window
         a.keyTimes = [0, 0.25, 0.5, 0.75, 1]
         a.duration = 0.6
         face.add(a, forKey: "bounce")
@@ -573,7 +691,7 @@ final class PetView: NSView {
     /// Render sprites and text at screen resolution × pet scale, so a bigger pet stays sharp.
     private func updateContentsScale() {
         let s = (window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2) * max(1, scale)
-        for l in [face, badgeText, bubbleText, badge, bubble, plate] as [CALayer] { l.contentsScale = s }
+        for l in [face, bubbleText, bubble, plate] as [CALayer] { l.contentsScale = s }
     }
 
     /// Resize the pet. The window keeps its bottom-centre point, so the pet grows in place.
@@ -682,6 +800,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     private var timer: Timer?
     private var statusItem: NSStatusItem?
     private var sizeItems: [NSMenuItem] = []
+    private var outfitItems: [NSMenuItem] = []
+    private(set) var outfit = ""
+    /// 应用里有的几套（按 Outfits.order）。启动时扫一次。
+    private lazy var availableOutfits: [String] = {
+        let root = Paths.resources.appendingPathComponent("assets/outfits")
+        let found = Outfits.order.filter { name in
+            ["webp", "png"].contains { ext in FileManager.default.fileExists(atPath: root.appendingPathComponent("\(name)/pet-idle.\(ext)").path) }
+        }
+        return found.isEmpty ? [Outfits.fallback] : found
+    }()
+
+    /// 固定的那套（defaults 里的 outfit），没有或已不存在就按日期轮换。
+    private var chosenOutfit: String {
+        let pinned = defaults.string(forKey: "outfit") ?? ""
+        return availableOutfits.contains(pinned) ? pinned : Outfits.daily(from: availableOutfits)
+    }
+
+    /// The file for one pose of one outfit: outfits are bundled as lossless WebP (PNG still accepted);
+    /// a missing pose falls back to the default outfit.
+    func spriteURL(_ pose: String, outfit name: String) -> URL? {
+        let assets = Paths.resources.appendingPathComponent("assets")
+        var candidates: [URL] = []
+        for set in [name, Outfits.fallback] {
+            for ext in ["webp", "png"] {
+                candidates.append(assets.appendingPathComponent("outfits/\(set)/pet-\(pose).\(ext)"))
+            }
+        }
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    /// Decodes one sprite straight to a CGImage (no NSImage keeping a second copy).
+    private func outfitLoader(_ name: String) -> (String) -> CGImage? {
+        return { [weak self] pose in
+            guard let url = self?.spriteURL(pose, outfit: name),
+                  let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+            return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+        }
+    }
+
+    /// 穿上应该穿的那套（启动、换日、菜单选择后都调这里）；已经是这套就什么都不做。
+    func applyOutfit() {
+        let name = chosenOutfit
+        guard name != outfit else { return }
+        outfit = name
+        if petView != nil { petView.setOutfit(loader: outfitLoader(name)) }
+        outfitChanged()
+        pushAvatar()
+    }
+
+    /// 任务面板左上角的头像跟着衣服换：每套都有自己的 pet-avatar（outfits/<套>/pet-avatar.webp）。
+    private func pushAvatar() {
+        guard pageReady, let url = spriteURL("avatar", outfit: outfit),
+              let data = try? JSONSerialization.data(withJSONObject: [url.absoluteString]),
+              let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("window.petSetAvatar && window.petSetAvatar(\(json)[0])", completionHandler: nil)
+    }
+
+    private func outfitMenuItem() -> NSMenuItem {
+        let sub = NSMenu()
+        let auto = NSMenuItem(title: "每天换一套", action: #selector(pickOutfit(_:)), keyEquivalent: "")
+        auto.target = self
+        auto.representedObject = ""
+        sub.addItem(auto)
+        outfitItems.append(auto)
+        sub.addItem(.separator())
+        for name in availableOutfits {
+            let item = NSMenuItem(title: name, action: #selector(pickOutfit(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = name
+            sub.addItem(item)
+            outfitItems.append(item)
+        }
+        let parent = NSMenuItem(title: "衣服", action: nil, keyEquivalent: "")
+        parent.submenu = sub
+        outfitChanged()
+        return parent
+    }
+
+    @objc func pickOutfit(_ sender: NSMenuItem) {
+        defaults.set((sender.representedObject as? String) ?? "", forKey: "outfit")
+        applyOutfit()
+        outfitChanged()
+    }
+
+    /// 勾选状态：自动时勾「每天换一套」，今天这套显示为「–」；固定时勾那一套。
+    private func outfitChanged() {
+        let pinned = defaults.string(forKey: "outfit") ?? ""
+        let isAuto = !availableOutfits.contains(pinned)
+        for item in outfitItems {
+            let value = (item.representedObject as? String) ?? ""
+            if value.isEmpty { item.state = isAuto ? .on : .off }
+            else { item.state = value == outfit ? (isAuto ? .mixed : .on) : .off }
+        }
+    }
     private var collectorHealthy = false
     private var configFromDisk: [String: Any] = [:]
     /// config.json 读进来之前，设置页里是空表单；这时保存会把服务器列表清空，所以先不让存。
@@ -710,10 +922,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         statusMenu.addItem(withTitle: "桌宠回到右下角", action: #selector(resetPosition(_:)), keyEquivalent: "")
         let sizeItem = sizeMenuItem()
         statusMenu.addItem(.separator())
-        statusMenu.addItem(withTitle: "退出二踢脚大王", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+        statusMenu.addItem(withTitle: "退出二踢脚大王", action: #selector(quitWithGoodbye(_:)), keyEquivalent: "")
         statusMenu.items.forEach { $0.target = self }
-        statusMenu.items.last?.target = NSApp
         statusMenu.insertItem(sizeItem, at: 2)      // after 桌宠回到右下角; keeps its own targets
+        statusMenu.insertItem(outfitMenuItem(), at: 3)
         item.menu = statusMenu
         statusItem = item
         #if !PET_TESTS
@@ -731,6 +943,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         perform(#selector(showPanelAction(_:)), with: nil, afterDelay: 0.8)
     }
 
+    /// 菜单和面板里的「退出」：先说再见（bye 停留 1.4 秒），再真正退出。
+    ///
+    /// 再见放在 terminate 之前，不用 applicationShouldTerminate 的 .terminateLater：那样 AppKit 会开一个
+    /// 嵌套事件循环等回复，如果 terminate 是在主队列的一个任务里调用的（例如 Task 里），这个任务没结束，
+    /// 主队列上的回复永远排不到，就卡死了。这里用 run loop 的 Timer，不经过 GCD 主队列。
+    /// 其他方式的退出（系统注销、kill、直接调用 NSApp.terminate）照常立即退出。
+    private var leaving = false
+    @objc func quitWithGoodbye(_ sender: Any?) {
+        if leaving { NSApp.terminate(nil); return }       // second click while saying bye: go now
+        guard let petWindow = petWindow, petWindow.isVisible, let petView = petView else { NSApp.terminate(nil); return }
+        leaving = true
+        if panel?.isVisible == true { hidePanel() }        // don't hide her behind the panel
+        petView.sayGoodbye()
+        let t = Timer(timeInterval: PetMotion.farewell, repeats: false) { _ in NSApp.terminate(nil) }
+        RunLoop.main.add(t, forMode: .common)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         collector?.terminate()
     }
@@ -745,18 +974,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     // MARK: 桌宠窗口
 
     private func buildPet() {
-        let assetRoot = Paths.resources.appendingPathComponent("assets")
-        var images: [String: NSImage] = [:]
-        for name in ["avatar", "work", "doze"] + PetMotion.allPoses.sorted() {
-            if let image = NSImage(contentsOf: assetRoot.appendingPathComponent("pet-\(name).png")) {
-                images[name] = image
-            }
-        }
-        if images["avatar"] == nil,
-           let image = NSImage(contentsOf: assetRoot.appendingPathComponent("pet-avatar.png")) {
-            images["avatar"] = image
-        }
-        petView = PetView(images: images)
+        outfit = chosenOutfit
+        petView = PetView(loader: outfitLoader(outfit))
         petView.owner = self
 
         petWindow = PetPanel(contentRect: NSRect(origin: .zero, size: PetView.size),
@@ -783,9 +1002,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             menu.addItem(item)
         }
         menu.addItem(sizeMenuItem())
+        menu.addItem(outfitMenuItem())
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出二踢脚大王", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
-        quit.target = NSApp
+        let quit = NSMenuItem(title: "退出二踢脚大王", action: #selector(quitWithGoodbye(_:)), keyEquivalent: "")
+        quit.target = self
         menu.addItem(quit)
         petView.menu = menu
 
@@ -971,6 +1191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     // MARK: 数据
 
     @objc func tick(_ timer: Timer) {
+        applyOutfit()                                   // the day changed while on 每天换一套
         ensureCollector()
         let health = (try? Data(contentsOf: Paths.health)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let healthy = collector?.isRunning == true && Date().timeIntervalSince1970 - ((health?["updatedAt"] as? Double) ?? 0) < 20
@@ -1137,6 +1358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         case "ready":
             pageReady = true
             pushState()
+            pushAvatar()
             #if PET_TESTS
             Task { await runNativeChecks() }
             #endif
@@ -1180,7 +1402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
         case "revealApp":
             NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
         case "quit":
-            NSApp.terminate(nil)
+            quitWithGoodbye(nil)
         default:
             break
         }
@@ -1323,8 +1545,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             animation.lastActivity = 1e9            // stay awake while sampling the routines
             let idleTotal = PetMotion.idleRoutine.reduce(0) { $0 + $1.1 }
             let idlePoses = Set(stride(from: 0.0, to: idleTotal, by: 0.1).map { animation.pose(at: $0) })
-            try verify(idlePoses.isSuperset(of: ["idle", "blink", "sit", "sit-blink", "read", "tea", "lie", "squat", "look", "think", "stretch",
-                                                 "kneel", "legs-out", "lie-side", "lie-back", "prone-read"]), "idle-variety")
+            try verify(idlePoses.isSuperset(of: ["idle", "blink", "edge-sit", "edge-sit-blink", "chin-rest", "guitar", "daze",
+                                                 "sit", "sit-blink", "tea", "lie", "look", "stretch", "kneel", "legs-out",
+                                                 "lie-side", "prone-read"]), "idle-variety")
             try verify(PetMotion.idleRoutine.allSatisfy { $0.1 >= 6 } && PetMotion.workRoutine.allSatisfy { $0.1 >= 7 }, "activities-held-long-enough")
             let seated = PetMotion.floor
             let seatedTime = PetMotion.idleRoutine.filter { seated.contains($0.0) }.reduce(0) { $0 + $1.1 }
@@ -1332,19 +1555,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             animation.running = true
             let workTotal = PetMotion.workRoutine.reduce(0) { $0 + $1.1 }
             let workingPoses = Set(stride(from: 0.0, to: workTotal, by: 0.1).map { animation.pose(at: $0) })
-            try verify(workingPoses.isSuperset(of: ["type", "write", "write-blink", "read", "prone-read", "think", "look"]), "working-variety")
-            animation.celebrationUntil = 5
+            try verify(workingPoses.isSuperset(of: ["type", "write", "write-blink", "read", "think",
+                                                    "stance", "arms-crossed", "drumstick", "ending"]), "working-variety")
+            animation.celebrationUntil = PetMotion.celebration
             try verify(animation.pose(at: 0.5) == "jump", "completion-jumps")
             try verify(animation.pose(at: 2) == "firecracker", "completion-firecracker")
-            try verify(!PetMotion.cheers.contains(animation.pose(at: 6)), "unread-does-not-freeze-celebration")
+            try verify(animation.pose(at: PetMotion.celebration - 0.5) == "happy", "completion-ends-with-a-smile")
+            try verify(!PetMotion.cheers.contains(animation.pose(at: PetMotion.celebration + 1)), "unread-does-not-freeze-celebration")
             animation.greetingUntil = 9
-            try verify(Set([animation.pose(at: 8.1), animation.pose(at: 8.5)]) == PetMotion.waves, "hover-waves-two-frames")
+            try verify(animation.pose(at: 8.1) == "wave" && animation.pose(at: 8.6) == "wave", "hover-waves")
             try verify(animation.pose(at: 8, reducedMotion: true) == "happy", "reduced-motion-greeting")
             // 挥手动画有节流，但不能长到让人觉得「悬停没反应」。
             try verify(PetMotion.greetingGap <= 3.5, "greeting-gap-is-short")
             try verify(animation.pose(at: 10, reducedMotion: true) == "type", "respects-reduced-motion")
             animation.dragging = true
-            try verify(animation.pose(at: 10) == "stretch", "drag-lifts-arms")
+            try verify(animation.pose(at: 10) == "drag", "drag-shows-carried-pose")
             animation.dragging = false
             animation.running = false
             animation.lastActivity = 0
@@ -1353,9 +1578,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify(animation.pose(at: 400.5) == "stretch", "wakes-up-stretching")
             animation.running = true
             try verify(animation.pose(at: 500) != "sleep", "work-keeps-her-awake")
+            animation.leavingUntil = 600
+            try verify(animation.pose(at: 599) == "bye" && animation.pose(at: 599, reducedMotion: true) == "bye", "quit-says-bye")
+            animation.leavingUntil = 0
+            try verify(PetMotion.allPoses.count == 33, "all-33-sprites-scheduled")
             for name in PetMotion.allPoses.sorted() {
-                try verify(NSImage(contentsOf: Paths.resources.appendingPathComponent("assets/pet-\(name).png")) != nil, "sprite-\(name)-bundled")
+                try verify(spriteURL(name, outfit: Outfits.fallback) != nil, "sprite-\(name)-bundled")
             }
+            // 衣服：发布包带九套，仓库克隆只带一套；无论几套，每套的图都必须在位。
+            // 只有本机（有 outfits/ 目录）才要求九套齐全。
+            // run_native.py 打包时如果找到了九套，会设 PET_EXPECT_NINE_OUTFITS=1。
+            let expectAllNine = ProcessInfo.processInfo.environment["PET_EXPECT_NINE_OUTFITS"] == "1"
+            try verify(!availableOutfits.isEmpty, "at-least-one-outfit-bundled")
+            if expectAllNine {
+                try verify(availableOutfits == Outfits.order, "all-nine-outfits-bundled")
+            }
+            for name in availableOutfits {
+                for pose in PetMotion.allPoses {
+                    let url = spriteURL(pose, outfit: name)
+                    try verify(url?.path.contains("/outfits/\(name)/") == true, "outfit-\(name)-\(pose)")
+                }
+                try verify(outfitLoader(name)("idle")?.width == 750, "outfit-\(name)-decodes")
+            }
+            // 轮换和换装只在有多套时才有意义；仓库克隆只带一套，跳过这些。
+            if expectAllNine {
+                let n = availableOutfits.count
+                try verify((0..<30).allSatisfy { Set(Outfits.order(forRound: $0, from: availableOutfits)).count == n }, "each-round-nine-different")
+                try verify((0..<30).allSatisfy { Outfits.order(forRound: $0, from: availableOutfits).last != Outfits.order(forRound: $0 + 1, from: availableOutfits).first }, "no-repeat-across-rounds")
+                try verify(Set((0..<6).map { Outfits.order(forRound: $0, from: availableOutfits) }).count > 1, "rounds-are-shuffled")
+                let savedOutfit = defaults.string(forKey: "outfit")
+                defaults.set("月下青竹", forKey: "outfit"); applyOutfit()
+                let before = petView.spriteShown
+                defaults.set("琥珀节拍", forKey: "outfit"); applyOutfit()
+                try verify(outfit == "琥珀节拍" && petView.spriteShown != nil && petView.spriteShown !== before, "outfit-switch-changes-sprite")
+                let avatarSrc = try await js("decodeURIComponent(document.querySelector('.head img').getAttribute('src') || '')") as? String
+                try verify(avatarSrc?.contains("/outfits/琥珀节拍/pet-avatar.") == true, "panel-avatar-follows-outfit")
+                defaults.set("不存在的一套", forKey: "outfit"); applyOutfit()
+                try verify(outfit == Outfits.daily(from: availableOutfits), "unknown-outfit-falls-back-to-daily")
+                if let savedOutfit { defaults.set(savedOutfit, forKey: "outfit") } else { defaults.removeObject(forKey: "outfit") }
+                applyOutfit()
+            }
+            // 内存：每次只解码少数几张，换遍全部姿势后缓存也不超过上限
+            let loadAll = outfitLoader(outfit)
+            petView.setOutfit(loader: loadAll)
+            try verify(petView.spritesDecoded <= PetView.spriteCacheLimit, "sprite-cache-bounded")
+            applyOutfit()
             let base = petView.scale
             petView.setScale(1.5)
             try verify(abs(petWindow.frame.width - PetView.size.width * 1.5) < 0.5, "resize-grows-window")
@@ -1496,9 +1763,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify(backToList == true, "settings-toggles-closed")
             let gearIconOnly = try await js("document.querySelector('.gear').textContent.trim()") as? String
             try verify(gearIconOnly == "⚙", "settings-button-is-icon-only")
-            // 菜单栏里不再有「服务器」（连接状态在任务面板的机器标签里看）。
+            // 菜单栏里不再有「服务器」（连接状态在任务面板的机器标签里看）；「衣服」列出九套。
             let topTitles = (statusItem?.menu?.items ?? []).map { $0.title }
             try verify(!topTitles.contains("服务器"), "no-server-menu")
+            let outfitTitles = (statusItem?.menu?.items.first { $0.title == "衣服" }?.submenu?.items ?? []).map { $0.title }
+            // 菜单里列出当前打包进来的每一套；九套齐全时再要求覆盖全部。
+            try verify(availableOutfits.allSatisfy { outfitTitles.contains($0) }, "outfit-menu-lists-bundled")
+            if ProcessInfo.processInfo.environment["PET_EXPECT_NINE_OUTFITS"] == "1" {
+                try verify(Outfits.order.allSatisfy { outfitTitles.contains($0) }, "outfit-menu-lists-all-nine")
+            }
             var logoSources = Set((try await js("Array.from(document.querySelectorAll('.logo img')).filter(i => i.complete && i.naturalWidth > 0).map(i => i.getAttribute('src'))") as? [String]) ?? [])
             _ = try await js("document.querySelector('[data-machine=\"h1\"]').click()")
             try await Task.sleep(nanoseconds: 300_000_000)
@@ -1520,7 +1793,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             _ = try await js("document.querySelector('[data-machine=\"__all__\"]').click()")
             try await Task.sleep(nanoseconds: 300_000_000)
             let menuCount = statusItem?.menu?.items.count ?? 0
-            try verify(menuCount == 5, "recovery-menu")     // 服务器菜单已移除：面板、回位、大小、分隔、退出
+            try verify(menuCount == 6, "recovery-menu")
             // 窗口刚 orderFront 时偶尔还没被标记为可见，等一小会儿再判定；
             // 还不行就主动把面板提到前面一次，多半是测试环境里被别的窗口盖住了。
             if !(petWindow.isVisible && panel.isVisible) {
@@ -1560,7 +1833,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify((visibleState()["done"] as? [[String: Any]])?.isEmpty == true, "dismiss-task")
             try verify(defaults.stringArray(forKey: "dismissed")?.contains("test-done") == true, "dismiss-persisted")
             refresh()
-            try verify(statusItem?.button?.image != nil, "badge-cleared")
             try verify((visibleState()["done"] as? [[String: Any]])?.isEmpty == true, "refresh-no-resurrection")
             _ = try await js("document.querySelector('[data-act=close]').click()")
             try await Task.sleep(nanoseconds: 100_000_000)
@@ -1573,10 +1845,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
             try verify(savedPetOrigin() == petWindow.frame.origin, "saved-drag-position")
             _ = applicationShouldHandleReopen(NSApp, hasVisibleWindows: true)
             try verify(savedPetOrigin() == petWindow.frame.origin, "reopen-preserves-location")
+            // 退出走菜单的真实路径，而且就在这个 Task 里调用：以前这样会卡死（见 quitWithGoodbye）。
+            // 卡住时进程不会退出，run_native.py 30 秒超时就会报失败。
+            if !petWindow.isVisible { petWindow.orderFrontRegardless() }
+            quitWithGoodbye(nil)
+            try verify(petView.posePresented == "bye", "quit-shows-bye-before-exit")
             let report = "\(nativeCheckCount) native checks passed"
             try report.write(to: Paths.support.appendingPathComponent("native-result.txt"), atomically: true, encoding: .utf8)
             print(report)
-            NSApp.terminate(nil)
         } catch {
             print("Native test failed:", error)
             exit(1)

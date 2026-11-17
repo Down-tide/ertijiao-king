@@ -7,7 +7,6 @@ DeepSeek Harness：session.v4.jsonl.zstd 中的 turn/start、turn/end
 远程服务器：由 ssh_remote.py 在远端只读汇总，本机只收一行 JSON（见 RemoteHost）
 """
 import argparse
-import glob
 import io
 import json
 import logging
@@ -301,6 +300,24 @@ def codex_question_rows(row, turns, latest):
             t.get('asks', {}).pop('q:' + str(call), None)      # the async one is answered later
 
 
+def codex_turn_for(turns, tid, latest, ts):
+    """The turn a message belongs to, created if Codex has not opened it yet.
+
+    Normally `task_started` comes first and the turn already exists. But when your
+    prompt makes Codex compact the thread first, the message is written with its
+    `turn_id` while the turn itself only starts after the compaction: looking the
+    id up returned nothing and the question was dropped, so the panel showed the
+    task with no prompt. Treat it as queued until its `task_started` arrives.
+    """
+    if not tid:
+        return latest
+    turn = turns.get(tid)
+    if turn is None:
+        turn = turns[tid] = new_turn(tid, ts)
+        turn['queued'] = True
+    return turn
+
+
 def clear_async_questions(turns):
     """You wrote in the thread again (an answer or anything else): open async questions are done."""
     for t in turns.values():
@@ -412,6 +429,7 @@ def parse_codex(path):
                 previous = latest
                 latest = info['turns'].setdefault(tid, new_turn(tid))
                 latest['start'] = latest['start'] or stamp(p.get('started_at')) or ts
+                latest['queued'] = False        # it has really started now
                 if ev == 'task_started' and (p.get('turn_attribution') or {}).get('turn_trigger') == 'resume_interrupted_task':
                     # Codex restarts an interrupted turn by itself; it carries no new prompt.
                     latest['resumed'] = True
@@ -438,7 +456,7 @@ def parse_codex(path):
                     if value:
                         clear_async_questions(info['turns'])
                     prompt = prompt or value
-                    t = info['turns'].get(tid) if tid else latest
+                    t = codex_turn_for(info['turns'], tid, latest, ts)
                     if t:
                         keep_first_prompt(t, value)
             elif ev == 'user_message':
@@ -446,7 +464,7 @@ def parse_codex(path):
                 if value:
                     clear_async_questions(info['turns'])
                 prompt = prompt or value
-                t = info['turns'].get(tid) if tid else latest
+                t = codex_turn_for(info['turns'], tid, latest, ts)
                 if t:
                     keep_first_prompt(t, value)
             elif ev == 'thread_goal_updated' and not goal:
@@ -1335,18 +1353,24 @@ def _claude_code_running(audit_path=None, session_ids=()):
     ``missing`` means the command worker has gone away; it is the signal used
     for an unrecorded user Stop.  ``unknown`` is reserved for an unreadable
     registry and is kept visible for safety.
+
+    No registry folder at all is ``unknown``, not ``missing``: it is not proof that
+    the worker stopped (a Claude version may keep the registry elsewhere), and
+    treating it as stopped would hide every running local task after 10 s.  A real
+    Stop is still caught by the transcript marker and by the result row.
     """
     if audit_path is None:
         return 'unknown'
     session_dir = Path(audit_path).parent / '.claude' / 'sessions'
     wanted = {str(value) for value in session_ids if value}
+    if not session_dir.is_dir():
+        return 'unknown'
     try:
         files = list(session_dir.glob('*.json'))
     except OSError:
         return 'unknown'
     if not files:
         return 'missing'
-    found = False
     for path in files:
         try:
             with path.open(encoding='utf-8', errors='replace') as f:
@@ -1355,7 +1379,6 @@ def _claude_code_running(audit_path=None, session_ids=()):
             continue
         if not isinstance(rec, dict) or (wanted and str(rec.get('sessionId') or '') not in wanted):
             continue
-        found = True
         pid = rec.get('pid')
         if not isinstance(pid, int) or not _process_alive(pid):
             continue
@@ -1367,7 +1390,7 @@ def _claude_code_running(audit_path=None, session_ids=()):
         if status in ('idle', 'stopped', 'exited', 'gone'):
             return 'idle'
         return 'unknown'
-    return 'missing' if found or files else 'unknown'
+    return 'missing'          # the folder has records, none of them a live worker of this session
 
 
 def _process_alive(pid):

@@ -260,6 +260,32 @@ class ProbeChecks(unittest.TestCase):
         self.assertEqual(item['prompt'], '压缩前提的问题')
         self.assertEqual(item['detail'], '答完了')
 
+    def test_codex_prompt_before_its_task_started_is_kept(self):
+        """一发出 prompt 就触发压缩：消息带着 turn_id 先落盘，task_started 还没写。
+
+        按 turn_id 查不到回合时，提问以前被整条丢掉，面板上这个任务没有提问。
+        """
+        self.codex_session('t-queue', [
+            self.event('task_started', self.iso(900), turn_id='a', started_at=self.now-900),
+            self.event('user_message', self.iso(890), turn_id='a', message='上一轮的问题'),
+            self.event('task_complete', self.iso(800), turn_id='a', completed_at=self.now-800,
+                       last_agent_message='上一轮答完了'),
+            self.event('user_message', self.iso(60), turn_id='b', message='压缩时发出的这个问题'),
+        ])
+        items = self.collect()['items']
+        self.assertEqual([(i['state'], i['prompt']) for i in items],
+                         [('running', '压缩时发出的这个问题')])
+        # task_started 随后补上：同一个回合，不再算排队。
+        self.codex_session('t-queue', [
+            self.event('user_message', self.iso(60), turn_id='b', message='压缩时发出的这个问题'),
+            self.event('task_started', self.iso(30), turn_id='b', started_at=self.now-30),
+            self.event('task_complete', self.iso(10), turn_id='b', completed_at=self.now-10,
+                       last_agent_message='答完了'),
+        ])
+        item = self.collect()['items'][0]
+        self.assertEqual((item['state'], item['prompt'], item['detail']),
+                         ('success', '压缩时发出的这个问题', '答完了'))
+
     def test_codex_subagent_and_prompt_wrappers_are_ignored(self):
         self.write('~/.codex/sessions/2026/11/04/rollout-x-child.jsonl', [
             {'timestamp': self.iso(2400), 'type': 'session_meta',
@@ -477,6 +503,41 @@ class ProbeChecks(unittest.TestCase):
         item = self.collect()['items'][0]
         self.assertEqual((item['state'], item['prompt']), ('success', '先修登录'))
         self.assertEqual((item['followups'], item['followupCount']), (['顺便看下日志'], 1))
+
+    @unittest.mock.patch.object(probe, 'pid_alive', return_value=True)
+    def test_claude_prompt_that_triggers_a_compact_is_still_shown(self, _alive):
+        """一发出 prompt 就触发自动压缩：提问只以 queued_command 附件落盘。
+
+        压缩期间 Claude Code 还没写 user 行，上一轮已经结束（current 为空），
+        附件因此被整条丢掉，面板只剩“没找到这一轮的提问”。
+        """
+        queued = {'type': 'attachment', 'isSidechain': False, 'sessionId': 's-1',
+                  'timestamp': self.iso(60),
+                  'attachment': {'type': 'queued_command', 'prompt': '压缩时发出的这个问题'}}
+        summary = dict(self.user('This session is being continued from a previous conversation. Summary...', 30),
+                       isCompactSummary=True)
+        self.claude_session('s-1', [self.user('上一轮的问题', 600),
+                                    self.assistant('上一轮答完了', 500, stop='end_turn'),
+                                    queued, summary], status='compacting')
+        item = self.collect()['items'][0]
+        self.assertEqual((item['state'], item['prompt']), ('running', '压缩时发出的这个问题'))
+        self.assertAlmostEqual(item['start'], self.now-60, delta=1)
+
+    @unittest.mock.patch.object(probe, 'pid_alive', return_value=True)
+    def test_claude_compact_summary_does_not_stop_the_window_widening(self, _alive):
+        """压缩摘要是 user 行，但不是你的提问：不能当作“开轮事件”。
+
+        否则 4MB 尾部窗口停在摘要处不再扩大，而真正的提问还在窗口外面，
+        claude_tail 又会把摘要当噪声跳过，prompt 永远是空的。
+        """
+        pad = [self.assistant('工具循环 ' + 'x' * 400, 400) for _ in range(12000)]
+        summary = dict(self.user('This session is being continued from a previous conversation. Summary...', 200),
+                       isCompactSummary=True)
+        self.claude_session('s-1', [self.user('压缩前提的问题', 600), self.assistant('在做', 590)]
+                            + pad + [summary]
+                            + [self.assistant('做完了', 100, stop='end_turn')])
+        item = self.collect()['items'][0]
+        self.assertEqual((item['state'], item['prompt']), ('success', '压缩前提的问题'))
 
     @unittest.mock.patch.object(probe, 'pid_alive', return_value=True)
     def test_claude_code_own_rows_are_not_followups(self, _alive):

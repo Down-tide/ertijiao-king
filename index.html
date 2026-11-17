@@ -146,7 +146,8 @@
 <body>
 <div class="panel">
   <header class="head">
-    <img src="assets/pet-avatar.png" alt="">
+    <!-- 先显示默认那套（月下青竹）的头像；应用打开后会换成当前那套衣服的（petSetAvatar） -->
+    <img src="assets/outfits/月下青竹/pet-avatar.webp" alt="">
     <div class="head-copy">
       <h1>二踢脚大王的任务提醒</h1>
       <p id="summary">正在读取任务…</p>
@@ -595,6 +596,11 @@ window.petRender = (next) => {
     draftFromDisk = true;
   }
   renderAll();
+};
+// 换衣服时 Swift 传来这套的头像（file:// 地址）；浏览器里单独预览时保持默认头像。
+window.petSetAvatar = (src) => {
+  const img = document.querySelector('.head img');
+  if (img && src) img.src = src;
 };
 // 面板被收起时重置视图：下次打开应该看到任务列表，而不是上次停留的设置页。
 window.petPanelHidden = () => {

@@ -49,9 +49,20 @@ cp index.html collector.py ssh_remote.py "$RES/"
 cp -R vendor "$RES/vendor"
 "$PYBIN" -I -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import zstandard' "$RES/vendor" \
   || { echo "runtime/python 无法加载 vendor 里的 zstandard，多半是版本不对（要 3.9 或 3.12）。"; false; }
-cp public/assets/pet-*.png "$RES/assets/"
+# 桌宠形象：仓库里只带一套（月下青竹）；本机放了 outfits/ 就整套打进去。
+# 想让发布包带全部衣服，把 outfits/ 放在这个目录下再构建，它不会进 git。
 cp -R public/assets/logos "$RES/assets/"
 cp public/assets/AppIcon.icns "$RES/"
+mkdir -p "$RES/assets/outfits"
+if [[ -d outfits ]]; then
+  for d in outfits/*/; do
+    n="$(basename "$d")"; case "$n" in _*) ;; *) cp -R "outfits/$n" "$RES/assets/outfits/$n" ;; esac
+  done
+  echo "   形象：$(ls -d "$RES/assets/outfits"/*/ 2>/dev/null | wc -l | tr -d ' ') 套（来自本地 outfits/）"
+elif [[ -d public/assets/outfits ]]; then
+  cp -R public/assets/outfits/* "$RES/assets/outfits/" 2>/dev/null || true
+  echo "   形象：$(ls -d "$RES/assets/outfits"/*/ 2>/dev/null | wc -l | tr -d ' ') 套（仓库自带）"
+fi
 # 整份运行时打进应用：桌宠从 Resources/python/runtime/bin/python3 启动采集器。
 mkdir -p "$RES/python"
 cp -RL "$SRC_RUNTIME" "$RES/python/runtime"

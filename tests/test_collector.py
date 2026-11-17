@@ -189,6 +189,23 @@ class CollectorChecks(unittest.TestCase):
         self.assertEqual((d[0]['prompt'],d[0]['start']),('先修登录',self.now-90))
         self.assertEqual((d[0]['followups'],d[0]['followupCount']),(['顺便看下日志'],1))
 
+    def test_codex_prompt_before_its_task_started_is_kept(self):
+        """一发出 prompt 就触发压缩：消息带着 turn_id 先落盘，task_started 还没写。
+
+        按 turn_id 查不到回合时，提问以前被整条丢掉，面板上这个任务没有提问。
+        和 ssh_remote.py 同一处修复（服务器 Codex 也是这样）。
+        """
+        path=self.base/'rollout.jsonl'
+        def event(kind,ago,**args):return {'type':'event_msg','timestamp':self.now-ago,'payload':dict(type=kind,**args)}
+        self.write(path,[{'type':'session_meta','payload':{'id':'t'}},
+            event('task_started',900,turn_id='a',started_at=self.now-900),
+            event('user_message',890,turn_id='a',message='上一轮的问题'),
+            event('task_complete',800,turn_id='a',completed_at=self.now-800,last_agent_message='上一轮答完了'),
+            event('user_message',60,turn_id='b',message='压缩时发出的这个问题')])
+        r,d,p,s=c.Reader('chatgpt',self.base,'rollout.jsonl',c.parse_codex).collect(self.now,True)
+        self.assertEqual((len(r),len(d),len(p)),(1,0,0))
+        self.assertEqual((r[0]['prompt'],r[0]['detail']),('压缩时发出的这个问题','已排队，等待开始'))
+
     def test_followups_keep_the_latest_two_and_count_all(self):
         turn=c.new_turn('a')
         for text in ('第一个问题','追加一','追加二','追加三','追加二'):
@@ -385,6 +402,44 @@ class CollectorChecks(unittest.TestCase):
         reader = c.Reader('claude', root, '*/*/audit.jsonl', c.parse_claude)
         with patch.object(c, '_claude_code_running', return_value='missing'):
             r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual((r, d, p), ([], [], []))
+
+    def test_claude_local_task_stays_visible_without_a_registry_folder(self):
+        """No .claude/sessions folder is not evidence of a Stop: keep a running task running."""
+        root = self.base/'Claude-3p/local-agent-mode-sessions'
+        path = root/'sess/abcd1234/audit.jsonl'
+        self.write(path, [
+            {'type':'user','uuid':'u1','timestamp':self.now-60,'message':{'content':'还在跑的任务'}},
+            {'type':'command_lifecycle','command_uuid':'u1','state':'started','timestamp':self.now-60},
+        ])
+        reader = c.Reader('claude', root, '*/*/audit.jsonl', c.parse_claude)
+        r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual([i['prompt'] for i in r], ['还在跑的任务'])
+        self.assertEqual(c._claude_code_running(path, ()), 'unknown')
+
+    def test_claude_local_finished_without_result_needs_confirmation(self):
+        """In the real local root (not only a test root) 待确认 still appears after the grace."""
+        root = self.base/'Claude-3p/local-agent-mode-sessions'
+        path = root/'sess/abcd1234/audit.jsonl'
+        self.write(path, [
+            {'type':'command_lifecycle','command_uuid':'u1','state':'started','timestamp':self.now-60},
+            {'type':'command_lifecycle','command_uuid':'u1','state':'completed','timestamp':self.now-5},
+        ])
+        reader = c.Reader('claude', root, '*/*/audit.jsonl', c.parse_claude)
+        r, d, p, _ = reader.collect(self.now+c.RESULT_GRACE+1, True)
+        self.assertEqual((len(r), len(d), len(p)), (0, 0, 1))
+        self.assertEqual(p[0]['state'], 'unknown')
+
+    def test_claude_empty_registry_folder_means_the_worker_is_gone(self):
+        root = self.base/'Claude-3p/local-agent-mode-sessions'
+        path = root/'sess/abcd1234/audit.jsonl'
+        self.write(path, [
+            {'type':'user','uuid':'u1','timestamp':self.now-60,'message':{'content':'被停止的任务'}},
+            {'type':'command_lifecycle','command_uuid':'u1','state':'started','timestamp':self.now-60},
+        ])
+        (path.parent/'.claude/sessions').mkdir(parents=True)
+        reader = c.Reader('claude', root, '*/*/audit.jsonl', c.parse_claude)
+        r, d, p, _ = reader.collect(self.now, True)
         self.assertEqual((r, d, p), ([], [], []))
 
     def test_claude_worker_from_another_session_does_not_keep_task_running(self):

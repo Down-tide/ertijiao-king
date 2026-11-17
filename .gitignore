@@ -5,8 +5,9 @@ build-backups/
 *.app
 *.zip
 
-# 构建用的 Python（scripts/fetch_deps.py 下载）
-runtime/
+# 构建用的 Python（scripts/fetch_deps.py 下载，或从主目录链接过来）
+# 不带结尾的斜杠：runtime 也可能是软链接，"runtime/" 只匹配真目录，会把链接提交上去。
+/runtime
 
 # 运行期数据
 config.json
@@ -14,3 +15,7 @@ config.json
 __pycache__/
 *.pyc
 .DS_Store
+
+# 本机素材：九套衣服（只用于打完整发布包，仓库里只带一套）
+# 开头的斜杠只认仓库根目录的 outfits/；仓库自带的那套在 public/assets/outfits/，要提交。
+/outfits/

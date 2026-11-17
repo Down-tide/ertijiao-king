@@ -191,7 +191,7 @@ def tail_rows(path, budget=TAIL_BUDGET):
 def _OPENS_TURN(row):
     """An event that truly *starts* a turn, or names a thread.
 
-    Two things deliberately do not count:
+    These deliberately do not count:
 
     - Codex's `task_complete`. After a compact the ending sits far from the
       beginning; a tail holding only the ending would look complete and the
@@ -203,18 +203,29 @@ def _OPENS_TURN(row):
     - Claude's `assistant` rows. Replies come after the question; a tail full of
       tool loops has plenty of them and still no question, so they cannot stand
       in for the start of an exchange either.
+    - Claude rows that Claude Code wrote itself, above all the summary it writes
+      after compacting the context (`isCompactSummary`, text starting with
+      “This session is being continued”). It is a `type: user` row, so it used
+      to end the search — and `claude_tail` then skips it as noise, leaving the
+      panel with no question at all for exactly that exchange.
+    - Stop markers. `[Request interrupted by user]` closes an exchange; the
+      question it belonged to is written before it.
     """
     typ = row.get('type')
     if typ == 'session_meta':
         return True
     if typ == 'event_msg':
         return (row.get('payload') or {}).get('type') == 'task_started'
+    if typ == 'attachment':
+        return bool(queued_prompt(row))     # a message you typed while Claude was working
     if typ == 'user':
         content = (row.get('message') or {}).get('content')
         if isinstance(content, list) and any(
                 isinstance(part, dict) and part.get('type') == 'tool_result' for part in content):
             return False        # tool output, not a question
-        return True
+        if any(row.get(flag) for flag in CLAUDE_NOISE_FLAGS):
+            return False        # compaction summary, skill / command expansion
+        return bool(prompt_preview(text_content(content)))
     return False
 
 
@@ -320,6 +331,7 @@ def parse_codex(path):
             previous = latest
             latest = info['turns'].setdefault(tid, new_turn(tid))
             latest['start'] = latest['start'] or stamp(p.get('started_at')) or ts
+            latest['queued'] = False        # it has really started now
             if ev == 'task_started' and (p.get('turn_attribution') or {}).get('turn_trigger') == 'resume_interrupted_task':
                 latest['resumed'] = True
                 if not latest['prompt'] and previous is not None and previous is not latest and previous['prompt']:
@@ -343,7 +355,7 @@ def parse_codex(path):
                 if value:
                     clear_async_questions(info['turns'])
                 prompt = prompt or value
-                turn = info['turns'].get(tid) if tid else latest
+                turn = codex_turn_for(info['turns'], tid, latest, ts)
                 if turn:
                     keep_first_prompt(turn, value)
         elif ev == 'user_message':
@@ -351,7 +363,7 @@ def parse_codex(path):
             if value:
                 clear_async_questions(info['turns'])
             prompt = prompt or value
-            turn = info['turns'].get(tid) if tid else latest
+            turn = codex_turn_for(info['turns'], tid, latest, ts)
             if turn:
                 keep_first_prompt(turn, value)
         elif ev == 'thread_goal_updated' and not goal:
@@ -528,6 +540,24 @@ def question_reply(text):
     return '回答：' + '；'.join(a for a in answers if a) if any(answers) else '回答'
 
 
+def codex_turn_for(turns, tid, latest, ts):
+    """The turn a message belongs to, created if Codex has not opened it yet.
+
+    Normally `task_started` comes first and the turn already exists. But when your
+    prompt makes Codex compact the thread first, the message is written with its
+    `turn_id` while the turn itself only starts after the compaction: looking the
+    id up returned nothing and the question was dropped, so the panel showed the
+    task with no prompt. Treat it as queued until its `task_started` arrives.
+    """
+    if not tid:
+        return latest
+    turn = turns.get(tid)
+    if turn is None:
+        turn = turns[tid] = new_turn(tid, ts)
+        turn['queued'] = True
+    return turn
+
+
 def codex_question_rows(row, turns, latest):
     """Codex question tools are response items: open on the call; the blocking one closes
     on its output, the async one when you next write in the thread."""
@@ -578,9 +608,17 @@ def claude_tail(rows):
         ts = stamp(row.get('timestamp'))
         if typ == 'attachment':
             value = queued_prompt(row)
-            if value and current is not None:
-                keep_first_prompt(current, value)
+            if value:
                 last_row = max(last_row, ts)
+                if current is None:
+                    # Normally this is a message typed mid-turn, but it also happens
+                    # at the start of an exchange: when your prompt makes Claude Code
+                    # compact the context first, the prompt is queued behind the
+                    # compaction and only this attachment carries it. Dropping it left
+                    # the panel showing “没找到这一轮的提问” for the whole compaction.
+                    current = {'prompt': '', 'start': ts}
+                    last_prompt = max(last_prompt, ts)
+                keep_first_prompt(current, value)
             continue
         if typ not in ('user', 'assistant'):
             continue
