@@ -1,8 +1,8 @@
 # 二踢脚大王
 
 <p align="center">
-  <img src="public/docs/pet.png" width="150" alt="桌宠">
-  <img src="public/docs/panel.png" width="330" alt="任务面板">
+  <img src="public/docs/pet.png" width="180" alt="桌宠">
+  <img src="public/docs/panel.png" width="360" alt="任务面板">
 </p>
 
 二踢脚大王是一款 macOS 桌面宠物，用来跟踪 AI 编程助手的任务进度。它读取本机和远程服务器上的会话记录，
