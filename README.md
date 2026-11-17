@@ -4,12 +4,6 @@
   <img src="public/docs/banner.jpg" width="830" alt="二踢脚大王 2.0 · 九套衣服">
 </p>
 
-<p align="center">
-  <img src="public/docs/pet.png" width="180" alt="桌宠">
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="public/docs/panel.png" width="360" alt="任务面板">
-</p>
-
 二踢脚大王是一款 macOS 桌面宠物，用来跟踪 AI 编程助手的任务进度。它读取本机和远程服务器上的会话记录，
 在桌面上提示哪些任务在运行、哪些需要你处理、哪些已经完成。
 
