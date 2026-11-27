@@ -9,6 +9,8 @@
 settings.json / .claude.json 等凭据，也不输出转写正文，只给标题、提问预览
 （脱敏后截断）和状态时间。纯标准库，py3.8+。
 """
+from contextlib import closing
+from pathlib import Path
 import glob
 import json
 import os
@@ -171,7 +173,7 @@ def _read_tail(path, budget):
     return rows
 
 
-def tail_rows(path, budget=TAIL_BUDGET):
+def tail_rows(path, budget=TAIL_BUDGET, codex=False):
     """Parse the tail of a transcript, widening the window when the start is missing.
 
     A long-running Codex thread writes a lot of token counts after its last
@@ -181,10 +183,33 @@ def tail_rows(path, budget=TAIL_BUDGET):
     """
     size = os.path.getsize(path)
     limit = min(size, budget)
+    missing = None
     while True:
         rows = _read_tail(path, limit)
-        if any(_OPENS_TURN(row) for row in rows) or limit >= size:
+        if limit >= size:
             return rows
+        if any(_OPENS_TURN(row) for row in rows):
+            if not codex:
+                return rows
+            # The previous turn may end in the same second a Goal resumes.
+            # Fetch its opening as well, so we know which task it belongs to.
+            events = [row['payload'] for row in rows if row.get('type') == 'event_msg'
+                      and isinstance(row.get('payload'), dict)]
+            opened = {p.get('turn_id') for p in events if p.get('type') == 'task_started'}
+            if missing is None:
+                missing = {p['turn_id'] for p in events if p.get('type') == 'task_complete' and p.get('turn_id')} - opened
+            if missing.issubset(opened):
+                if not missing:
+                    return rows
+                # Keep lifecycle metadata, but exclude partial turns newly
+                # exposed at the beginning of the expanded window.
+                for i, row in enumerate(rows):
+                    p = row.get('payload') or {}
+                    if (row.get('type') == 'event_msg' and p.get('type') == 'task_started'
+                            and p.get('turn_id') in missing):
+                        metadata = [r for r in rows[:i] if r.get('type') == 'session_meta' or
+                                    (r.get('type') == 'event_msg' and (r.get('payload') or {}).get('type') == 'thread_goal_updated')]
+                        return metadata + rows[i:]
         limit = min(size, limit * 2)
 
 
@@ -292,6 +317,97 @@ def codex_thread_id(path, found=''):
     return os.path.splitext(name)[0]
 
 
+def read_codex_goals(root):
+    """Read one snapshot per poll, independently of the transcript cache."""
+    try:
+        import sqlite3
+    except ImportError:
+        return {}
+    path = (Path(root) / 'goals_1.sqlite').absolute()
+    try:
+        # With no WAL, immutable mode avoids creating journal sidecars. An
+        # existing WAL needs its shared index to be readable without setup.
+        wal = Path(str(path) + '-wal').exists()
+        if wal and not Path(str(path) + '-shm').exists():
+            return {}
+        uri = path.as_uri() + ('?mode=ro' if wal else '?mode=ro&immutable=1')
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.2)) as db:
+            rows = db.execute('SELECT thread_id, goal_id, objective, status, created_at_ms, updated_at_ms FROM thread_goals')
+            return {sid: dict(id=gid, objective=prompt_preview(obj), status=status,
+                              created=created / 1000, updated=updated / 1000)
+                    for sid, gid, obj, status, created, updated in rows}
+    except (OSError, sqlite3.Error):
+        return {}
+
+
+def record_goal_update(info, data, ts):
+    if not isinstance(data, dict):
+        return prompt_preview(data)
+    objective = prompt_preview(data.get('objective'))
+    snapshots = info.setdefault('goals', {})
+    created = stamp(data.get('createdAt'))
+    if not created:
+        prior = next(reversed(snapshots.values()), {})
+        created = prior.get('created') if prior.get('objective') == objective else ts
+    snapshots[created] = dict(objective=objective, status=data.get('status'), created=created,
+                              updated=stamp(data.get('updatedAt')) or ts)
+    return objective
+
+
+def codex_goal_turns(info, stored):
+    """Project Goal checkpoints into a task. Leave ordinary turns intact."""
+    turns = info['turns']
+    if not any(t.get('goal') for t in turns.values()):
+        return turns
+    snapshots = dict(info.get('goals', {}))
+    if stored:
+        # Rollouts round creation to seconds. The store also captures status
+        # changes made between turns, without a corresponding rollout event.
+        snapshots.pop(int(stored['created']), None)
+        snapshots[stored['created']] = stored
+    history = sorted(snapshots.values(), key=lambda g: g['created'], reverse=True)
+    result, groups = {}, {}
+    for t in turns.values():
+        if not t.get('goal'):
+            result[t['id']] = t
+            continue
+        opened = t.get('goal_at') or t.get('opened_at') or t['start']
+        goal = next((g for g in history if g['created'] <= opened), {})
+        objective = goal.get('objective') or t.get('objective') or t['prompt']
+        key = goal.get('id') or goal.get('created') or objective or t['id']
+        group = groups.setdefault(key, [])
+        group.append((t, goal))
+    for group in groups.values():
+        first = group[0][0]
+        t, goal = max(reversed(group), key=lambda pair: pair[0].get('opened_at') or pair[0]['start'])
+        state = goal.get('status')
+        if t.get('user_interrupted') or state == 'paused':
+            continue
+        goal_id = 'goal:' + str(goal.get('id') or first['id'])
+        label = goal.get('objective') or t.get('objective') or first.get('objective') or t['prompt'] or 'Codex 目标'
+        task = dict(t, id=goal_id, prompt=label, prompt_inherited=True,
+                    goal_start=goal.get('created') or first['start'])
+        # An async question can outlive its turn. Its matching user reply has
+        # already cleared it in the parser.
+        asks = {k: a for old, _ in group for k, a in old.get('asks', {}).items() if k.startswith('qa:')}
+        asks.update(t.get('asks', {}))
+        task['asks'] = asks
+        if state == 'complete':
+            task.update(end=goal['updated'] or t['end'], state='success', asks={},
+                        detail=t['detail'] if t['state'] == 'success' else '目标已完成')
+        elif t['state'] not in ('error', 'interrupted'):
+            if state in ('blocked', 'budget_limited', 'usage_limited'):
+                reason = {'blocked': '目标遇到阻碍', 'budget_limited': '目标已达到预算上限',
+                          'usage_limited': '目标已达到用量上限'}[state]
+                task.update(end=goal['updated'], state='unknown', detail=reason)
+            elif t['end'] and state == 'active':
+                task.update(end=0, state='running', detail='等待 Codex 继续执行目标')
+            elif t['end'] and not asks:
+                task.update(state='unknown', detail='本轮已结束，目标状态待确认')
+        result[goal_id] = task
+    return result
+
+
 def parse_codex(path):
     """Parse one Codex rollout file (server side, codex CLI).
 
@@ -303,7 +419,7 @@ def parse_codex(path):
     info = {'id': '', 'title': '', 'skip': False, 'turns': {}, 'last': 0}
     goal = prompt = ''
     latest = previous = None
-    for row in tail_rows(path):
+    for row in tail_rows(path, codex=True):
         p = row.get('payload')
         if not isinstance(p, dict):
             p = {}
@@ -321,8 +437,17 @@ def parse_codex(path):
             p = row.get('payload') or {}
             if p.get('type') == 'message' and p.get('role') == 'user':
                 value = goal_prompt(text_content(p.get('content')))
-                if value and latest is not None:
-                    keep_first_prompt(latest, value)
+                if value:
+                    meta = p.get('internal_chat_message_metadata_passthrough') or {}
+                    tid = meta.get('turn_id')
+                    turn = info['turns'].get(tid) if tid else latest
+                    if turn is not None and not turn['end']:
+                        turn['goal'] = True
+                        turn['objective'] = value
+                        turn['goal_at'] = ts
+                        if not turn['prompt']:
+                            turn['prompt'] = value
+                    goal = value
             continue
         if typ != 'event_msg':
             continue
@@ -332,6 +457,11 @@ def parse_codex(path):
             latest = info['turns'].setdefault(tid, new_turn(tid))
             latest['start'] = latest['start'] or stamp(p.get('started_at')) or ts
             latest['queued'] = False        # it has really started now
+            if ev == 'task_started':
+                latest['opened_at'] = ts or latest['start']
+                if (p.get('turn_attribution') or {}).get('turn_trigger') == 'goal':
+                    latest['goal'] = True
+                    latest['objective'] = goal
             if ev == 'task_started' and (p.get('turn_attribution') or {}).get('turn_trigger') == 'resume_interrupted_task':
                 latest['resumed'] = True
                 if not latest['prompt'] and previous is not None and previous is not latest and previous['prompt']:
@@ -366,9 +496,8 @@ def parse_codex(path):
             turn = codex_turn_for(info['turns'], tid, latest, ts)
             if turn:
                 keep_first_prompt(turn, value)
-        elif ev == 'thread_goal_updated' and not goal:
-            objective = p.get('goal')
-            goal = ((objective or {}).get('objective') if isinstance(objective, dict) else objective) or ''
+        elif ev == 'thread_goal_updated':
+            goal = record_goal_update(info, p.get('goal'), ts)
         elif ev == 'thread_name_updated':
             info['title'] = one_line(p.get('thread_name'), TITLE_LIMIT) or info['title']
     info['id'] = codex_thread_id(path, info['id'])
@@ -399,6 +528,7 @@ def codex_running(home):
 
 def collect_codex(home, now, window, host):
     titles = codex_titles(home)
+    goals = read_codex_goals(Path(home) / '.codex')
     cutoff = now - window
     files = []
     for path in glob.glob(os.path.join(home, '.codex', 'sessions', '*', '*', '*', 'rollout-*.jsonl')):
@@ -421,22 +551,27 @@ def collect_codex(home, now, window, host):
             continue
         info['title'] = titles.get(info['id'], info['title'])
         last = max(info['last'], mtime)
-        started = [t for t in info['turns'].values() if not t.get('queued')]
-        latest = max(started or list(info['turns'].values()), key=lambda t: t['start'])
+        turns = codex_goal_turns(info, goals.get(info['id']))
+        if not turns:
+            continue
+        started = [t for t in turns.values() if not t.get('queued')]
+        latest = max(started or turns.values(), key=lambda t: (t['start'], t.get('opened_at', 0)))
         # Turns you started yourself (not Codex resuming on its own), by when you asked.
-        asks = [t['start'] for t in info['turns'].values() if t.get('prompt') and not t.get('prompt_inherited')]
-        for turn in info['turns'].values():
+        prompt_times = [t['start'] for t in turns.values() if t.get('prompt') and not t.get('prompt_inherited')]
+        for turn in turns.values():
             # A newer turn supersedes an older interrupted/unknown one.
             if turn is not latest and not turn.get('queued') and (not turn['end'] or turn['state'] in ('interrupted', 'unknown')):
                 continue
             if turn.get('user_interrupted'):
                 continue
             # You asked again in this thread after it finished: you have seen it (as for Claude here).
-            if turn['end'] and any(a > turn['end'] for a in asks):
+            if turn['end'] and any(a > turn['end'] for a in prompt_times):
                 continue
             item = {'agent': 'chatgpt', 'host': host, 'session': info['id'], 'title': info['title'],
-                    'prompt': turn.get('prompt', ''), 'start': turn.get('start') or last,
+                    'prompt': turn.get('prompt', ''), 'start': turn.get('goal_start') or turn.get('start') or last,
                     'resumed': bool(turn.get('resumed'))}
+            if turn.get('goal'):
+                item['turn'] = turn['id']
             asks = turn.get('asks') or {}
             blocking = [a for k, a in asks.items() if k.startswith('q:')]
             pending_async = [a for k, a in asks.items() if k.startswith('qa:')]
@@ -451,7 +586,7 @@ def collect_codex(home, now, window, host):
             elif turn['end']:
                 item.update(state=turn['state'], detail=turn.get('detail', ''), time=turn['end'])
             elif now - last < STALE:
-                item.update(state='running', detail='已排队，等待开始' if turn.get('queued') else '', time=last)
+                item.update(state='running', detail='已排队，等待开始' if turn.get('queued') else turn.get('detail', ''), time=last)
             else:
                 item.update(state='unknown', time=last,
                             detail='超过 30 分钟没有新进展，请检查服务器上的任务')
@@ -514,7 +649,7 @@ GOAL_SET = re.compile(r'User set the goal:\s*"(.+?)"\s*(?:\n|$)', re.S)
 
 def goal_prompt(text):
     """The goal text from a codex_internal_context block, or '' if this is not one."""
-    found = GOAL_CONTEXT.search(str(text or ''))
+    found = GOAL_CONTEXT.fullmatch(str(text or '').strip())
     if not found:
         return ''
     body = found.group(1)
@@ -772,7 +907,15 @@ def collect_claude(home, now, window, host):
             # row.  A stopped task is already acknowledged and must not return
             # to the panel as a running item.
             continue
-        if tail['question'] and rec and rec['status'] != 'gone':
+        # Once the latest exchange has a terminal transcript row, trust that
+        # row over stale registry state or an older unanswered question. The
+        # registry can lag behind both an API error and the user's follow-up.
+        terminal = bool(tail.get('end') and tail['end'] >= tail['prompt_at'])
+        if terminal and tail.get('failure') and tail['failure'] >= tail['end']:
+            state, detail, end = 'error', tail['reply'] or '推理被中断（模型拒绝或超出长度）', tail['failure']
+        elif terminal:
+            state, detail, end = 'success', tail['reply'] or '已完成', tail['end']
+        elif tail['question'] and rec and rec['status'] != 'gone':
             # Claude asked you something (AskUserQuestion) and is waiting for the answer;
             # the registry may still say "busy", so the transcript decides.
             state, detail, end = 'question', tail['question'][0], 0

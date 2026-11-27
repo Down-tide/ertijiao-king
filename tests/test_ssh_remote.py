@@ -165,6 +165,24 @@ class ProbeChecks(unittest.TestCase):
         ])
         self.assertEqual(self.collect()['items'][0]['prompt'], '继续把预览问题修完')
 
+    def test_codex_goal_continuations_are_one_running_task(self):
+        def context(turn, ago):
+            return {'timestamp': self.iso(ago), 'type':'response_item',
+                    'payload': {'type':'message','role':'user','content':[{'type':'input_text',
+                        'text':'<codex_internal_context source="goal"><objective>持续修复桌宠</objective></codex_internal_context>'}],
+                        'internal_chat_message_metadata_passthrough': {'turn_id':turn}}}
+        second = int(self.now)-60
+        self.codex_session('t-goal3', [
+            self.event('task_started', self.iso(120), turn_id='g1', started_at=self.now-120,
+                       turn_attribution={'turn_trigger':'goal'}), context('g1', 119),
+            self.event('token_count', self.iso(90), padding='x'*(probe.TAIL_BUDGET+1024)),
+            self.event('task_complete', second+.422, turn_id='g1', completed_at=second),
+            self.event('task_started', second+.439, turn_id='g2', started_at=second,
+                       turn_attribution={'turn_trigger':'goal'}),
+        ])
+        items = self.collect()['items']
+        self.assertEqual((len(items), items[0]['prompt'], items[0]['state']), (1, '持续修复桌宠', 'running'))
+
     def test_claude_refusal_is_an_error_not_running(self):
         """Claude 被安全策略拒绝、或超出长度时，这一轮是异常结束，不是还在跑。
 
@@ -187,6 +205,28 @@ class ProbeChecks(unittest.TestCase):
         item = self.collect()['items'][0]
         self.assertEqual(item['state'], 'error')
         self.assertIn('safeguards', item['detail'])
+
+    def test_claude_api_error_wins_over_stale_waiting_registry(self):
+        """注册表滞后为 waiting 时，已写入的 API error 仍然必须显示为出错。"""
+        rows = [
+            self.user('执行推理任务', 60, sid='s-waiting-error'),
+            self.assistant('开始执行', 50, sid='s-waiting-error'),
+            self.assistant('API Error: upstream request failed', 20, stop='refusal', sid='s-waiting-error'),
+        ]
+        for status in ('permission', 'waiting', 'blocked'):
+            self.claude_session('s-waiting-error', rows, status=status)
+            item = next(i for i in self.collect()['items'] if i['session'] == 's-waiting-error')
+            self.assertEqual(item['state'], 'error', status)
+            self.assertIn('API Error', item['detail'])
+
+        continued = rows + [
+            self.user('继续回复', 10, sid='s-waiting-error'),
+            self.assistant('已经处理好了', 5, stop='end_turn', sid='s-waiting-error'),
+        ]
+        self.claude_session('s-waiting-error', continued, status='waiting')
+        item = next(i for i in self.collect()['items'] if i['session'] == 's-waiting-error')
+        self.assertEqual((item['state'], item['prompt'], item['detail']),
+                         ('success', '继续回复', '已经处理好了'))
 
     def test_claude_max_tokens_also_ends_the_turn(self):
         """被截断（max_tokens）同样是这一轮结束了，不能一直显示运行中。"""

@@ -20,6 +20,9 @@ import threading
 import time
 from datetime import datetime, timezone
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ssh_remote import codex_goal_turns, read_codex_goals, record_goal_update
+
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'vendor'))
 try:
     import zstandard
@@ -265,7 +268,7 @@ GOAL_SET = re.compile(r'User set the goal:\s*"(.+?)"\s*(?:\n|$)', re.S)
 
 def goal_prompt(text):
     """The goal text from a codex_internal_context block, or '' if this is not one."""
-    found = GOAL_CONTEXT.search(str(text or ''))
+    found = GOAL_CONTEXT.fullmatch(str(text or '').strip())
     if not found:
         return ''
     body = found.group(1)
@@ -419,8 +422,17 @@ def parse_codex(path):
                 # goal 模式下，你设的目标不会写成 UserMessage，只在这里出现。
                 if p.get('type') == 'message' and p.get('role') == 'user':
                     value = goal_prompt(text_content(p.get('content')))
-                    if value and latest is not None:
-                        keep_first_prompt(latest, value)
+                    if value:
+                        meta = p.get('internal_chat_message_metadata_passthrough') or {}
+                        tid = meta.get('turn_id')
+                        turn = info['turns'].get(tid) if tid else latest
+                        if turn is not None and not turn['end']:
+                            turn['goal'] = True
+                            turn['objective'] = value
+                            turn['goal_at'] = ts
+                            if not turn['prompt']:
+                                turn['prompt'] = value
+                        goal = value
                 continue
             if row.get('type') != 'event_msg':
                 continue
@@ -430,6 +442,11 @@ def parse_codex(path):
                 latest = info['turns'].setdefault(tid, new_turn(tid))
                 latest['start'] = latest['start'] or stamp(p.get('started_at')) or ts
                 latest['queued'] = False        # it has really started now
+                if ev == 'task_started':
+                    latest['opened_at'] = ts or latest['start']
+                    if (p.get('turn_attribution') or {}).get('turn_trigger') == 'goal':
+                        latest['goal'] = True
+                        latest['objective'] = goal
                 if ev == 'task_started' and (p.get('turn_attribution') or {}).get('turn_trigger') == 'resume_interrupted_task':
                     # Codex restarts an interrupted turn by itself; it carries no new prompt.
                     latest['resumed'] = True
@@ -467,8 +484,8 @@ def parse_codex(path):
                 t = codex_turn_for(info['turns'], tid, latest, ts)
                 if t:
                     keep_first_prompt(t, value)
-            elif ev == 'thread_goal_updated' and not goal:
-                goal = (p.get('goal') or {}).get('objective') or ''
+            elif ev == 'thread_goal_updated':
+                goal = record_goal_update(info, p.get('goal'), ts)
             elif ev == 'thread_name_updated':
                 info['title'] = p.get('thread_name') or info['title']
     info['title'] = one_line(info['title'], 50) or first_line(goal or prompt) or 'ChatGPT 当前任务'
@@ -906,6 +923,7 @@ class Reader:
         if not self.root.is_dir():
             return running, done, pending, 'missing'
         titles = self.conversation_titles()
+        goals = read_codex_goals(self.root) if self.agent == 'chatgpt' else {}
         # Claude's desktop wrapper can leave a started command in audit.jsonl
         # when its Code subprocess is stopped.  There is no terminal row to
         # parse in that case; once the short startup grace has passed, the
@@ -941,10 +959,15 @@ class Reader:
                 claude_process_state = (_claude_code_running(path, info.get('session_ids', ()))
                                         if self.agent == 'claude' and self.root.name == 'local-agent-mode-sessions'
                                         else None)
-                started_turns = [t for t in info['turns'].values() if not t.get('queued')]
-                latest_turn = max(started_turns or list(info['turns'].values()), key=lambda t: t['start'])
-                prompt_times = [prompt_time(x) for x in info['turns'].values()]
-                for t in info['turns'].values():
+                turns = info['turns']
+                if self.agent == 'chatgpt':
+                    turns = codex_goal_turns(info, goals.get(info['id']))
+                if not turns:
+                    continue
+                started_turns = [t for t in turns.values() if not t.get('queued')]
+                latest_turn = max(started_turns or turns.values(), key=lambda t: (t['start'], t.get('opened_at', 0)))
+                prompt_times = [prompt_time(x) for x in turns.values()]
+                for t in turns.values():
                     # A resumed conversation supersedes prior interrupted/unknown turns.
                     if t is not latest_turn and not t.get('queued') and (not t['end'] or t['state'] in ('interrupted', 'unknown')):
                         continue
@@ -964,7 +987,7 @@ class Reader:
                     if not t['end'] and t.get('soft_end') and now - t['soft_end'] > RESULT_GRACE:
                         # Finishing a command does not prove the task succeeded or was stopped.
                         t = dict(t, end=t['soft_end'], state='unknown', detail='命令已结束，未收到结果，请查看应用')
-                    item = dict(id=tid, agent=self.agent, title=info['title'] or '未命名任务', prompt=t.get('prompt', ''), detail=t['detail'], start=t['start'] or st.st_mtime, open=target, state=t['state'], resumed=bool(t.get('resumed')))
+                    item = dict(id=tid, agent=self.agent, title=info['title'] or '未命名任务', prompt=t.get('prompt', ''), detail=t['detail'], start=t.get('goal_start') or t['start'] or st.st_mtime, open=target, state=t['state'], resumed=bool(t.get('resumed')))
                     if t.get('followups'):
                         item.update(followups=list(t['followups']), followupCount=t.get('followup_count', len(t['followups'])))
                     asks = t.get('asks') or {}

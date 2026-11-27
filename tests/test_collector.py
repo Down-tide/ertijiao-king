@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -885,6 +886,59 @@ class CollectorChecks(unittest.TestCase):
         ])
         r, d, p, _ = c.Reader('chatgpt', self.base, 'rollout.jsonl', c.parse_codex).collect(self.now, True)
         self.assertEqual([i['prompt'] for i in r], ['把图片预览修好，先测试再让我装'])
+
+    def test_codex_goal_continuations_are_one_running_task(self):
+        path = self.base/'rollout.jsonl'
+        def event(kind, ago, **args):
+            return {'type':'event_msg','timestamp':self.now-ago,'payload':dict(type=kind, **args)}
+        context = lambda turn, ago: {'type':'response_item','timestamp':self.now-ago,
+            'payload': {'type':'message','role':'user','content':[{'type':'input_text',
+                'text':'<codex_internal_context source="goal"><objective>持续修复桌宠</objective></codex_internal_context>'}],
+                'internal_chat_message_metadata_passthrough': {'turn_id': turn}}}
+        self.write(path, [
+            {'type':'session_meta','payload':{'id':'thread'}},
+            event('task_started', 120, turn_id='g1', started_at=self.now-120,
+                  turn_attribution={'turn_trigger':'goal'}), context('g1', 119),
+            event('task_complete', 60, turn_id='g1', completed_at=self.now-60),
+            event('task_started', 30, turn_id='g2', started_at=self.now-30,
+                  turn_attribution={'turn_trigger':'goal'}), context('g2', 29),
+        ])
+        r, d, p, _ = c.Reader('chatgpt', self.base, 'rollout.jsonl', c.parse_codex).collect(self.now, True)
+        self.assertEqual((len(r), len(d), len(p)), (1, 0, 0))
+        self.assertEqual((r[0]['prompt'], r[0]['state']), ('持续修复桌宠', 'running'))
+
+    def test_active_goal_does_not_report_intermediate_completion(self):
+        path = self.base/'rollout.jsonl'
+        def event(kind, **args):
+            return {'type':'event_msg','timestamp':self.now-2,'payload':dict(type=kind, **args)}
+        self.write(path, [
+            {'type':'session_meta','payload':{'id':'thread'}},
+            event('task_started', turn_id='g1', started_at=self.now-120,
+                  turn_attribution={'turn_trigger':'goal'}),
+            {'type':'response_item','payload':{'type':'message','role':'user',
+                'content':[{'type':'input_text','text':'<codex_internal_context source="goal"><objective>继续工作</objective></codex_internal_context>'}],
+                'internal_chat_message_metadata_passthrough':{'turn_id':'g1'}}},
+            event('task_complete', turn_id='g1', completed_at=self.now-1),
+        ])
+        db = sqlite3.connect(self.base/'goals_1.sqlite')
+        self.addCleanup(db.close)
+        created = int((self.now-121)*1000)
+        with db:
+            db.execute('CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY, goal_id TEXT, '
+                       'objective TEXT, status TEXT, created_at_ms INTEGER, updated_at_ms INTEGER)')
+            db.execute('INSERT INTO thread_goals VALUES (?,?,?,?,?,?)',
+                       ('thread', 'goal-1', '继续工作', 'active', created, created))
+        reader = c.Reader('chatgpt', self.base, 'rollout.jsonl', c.parse_codex)
+        r, d, p, _ = reader.collect(self.now, True)
+        self.assertEqual((len(r), len(d), len(p)), (1, 0, 0))
+        self.assertEqual((r[0]['state'], r[0]['prompt']), ('running', '继续工作'))
+        for status, expected in [('paused', (0, 0, 0)), ('blocked', (0, 0, 1)), ('complete', (0, 1, 0))]:
+            with db:
+                db.execute('UPDATE thread_goals SET status=?, updated_at_ms=?', (status, int(self.now*1000)))
+            r, d, p, _ = reader.collect(self.now, True)
+            self.assertEqual((len(r), len(d), len(p)), expected, status)
+        self.assertEqual((d[0]['state'], d[0]['prompt']), ('success', '继续工作'))
+        self.assertEqual(reader.collect(self.now+2, True)[1], d)
 
     def test_codex_error_dict_shows_message_and_resumed_turn_is_marked(self):
         path=self.base/'rollout.jsonl'
