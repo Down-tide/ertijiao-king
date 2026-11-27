@@ -22,6 +22,7 @@ WINDOW = 24 * 3600
 STALE = 30 * 60
 # 这些 stop_reason 说明这一轮是异常结束的，不是正常完成。
 FAILED_REASONS = {'refusal', 'max_tokens', 'model_context_window_exceeded'}
+API_ERROR = re.compile(r'\bAPI\s+Error\b', re.I)
 RECORD_FRESH = 5 * 60        # 注册表 5 分钟内被写过，说明这个进程还活着
 TITLE_LIMIT = 50
 PROMPT_LIMIT = 120
@@ -799,7 +800,10 @@ def claude_tail(rows):
             reason = message.get('stop_reason')
             if reason and reason != 'tool_use':
                 end_turn = max(end_turn, ts)
-                if reason in FAILED_REASONS:
+                # Claude sometimes writes an API failure with stop_sequence
+                # instead of refusal. The visible error text is authoritative
+                # in that case, while a later user turn can still supersede it.
+                if reason in FAILED_REASONS or API_ERROR.search(reply or ''):
                     failure = max(failure, ts)
                 if current is not None:
                     done, current = current, None

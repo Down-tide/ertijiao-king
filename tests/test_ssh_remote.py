@@ -228,6 +228,19 @@ class ProbeChecks(unittest.TestCase):
         self.assertEqual((item['state'], item['prompt'], item['detail']),
                          ('success', '继续回复', '已经处理好了'))
 
+    def test_claude_api_error_text_wins_even_with_stop_sequence(self):
+        """某些服务器错误使用 stop_sequence，错误文本仍应优先于完成状态。"""
+        rows = [
+            self.user('跑半量验证', 60, sid='s-stop-sequence'),
+            self.assistant(
+                'API Error: 503 scheduler unavailable: scheduler temporarily unavailable',
+                20, stop='stop_sequence', sid='s-stop-sequence'),
+        ]
+        self.claude_session('s-stop-sequence', rows, status='idle')
+        item = next(i for i in self.collect()['items'] if i['session'] == 's-stop-sequence')
+        self.assertEqual(item['state'], 'error')
+        self.assertIn('503 scheduler unavailable', item['detail'])
+
     def test_claude_max_tokens_also_ends_the_turn(self):
         """被截断（max_tokens）同样是这一轮结束了，不能一直显示运行中。"""
         rows = [
